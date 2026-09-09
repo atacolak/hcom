@@ -818,7 +818,15 @@ fn background_runner_env(
         .entry("HCOM_TOOL".to_string())
         .or_insert_with(|| tool.to_string());
     runner_env.extend(tool_extra_env(tool));
+    apply_herdr_agent_hint(&mut runner_env, tool);
     runner_env
+}
+
+fn apply_herdr_agent_hint(env: &mut HashMap<String, String>, tool: &str) {
+    if let Some(kind) = crate::terminal::herdr_agent_kind(tool) {
+        env.entry("HERDR_AGENT".to_string())
+            .or_insert_with(|| kind.to_string());
+    }
 }
 
 /// Non-HCOM ambient env to forward through the sidecar, with marker/identity/
@@ -875,6 +883,9 @@ fn create_runner_script_windows(
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    if let Some(kind) = env.get("HERDR_AGENT") {
+        hcom_env.insert("HERDR_AGENT".to_string(), kind.clone());
+    }
     hcom_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
     let env_block = terminal::build_env_string(&hcom_env, "powershell");
 
@@ -1092,11 +1103,15 @@ pub fn create_runner_script(
     // The visible .sh only exports HCOM_* vars + PATH + cwd (minimal).
     // This avoids the sensitivity-classification heuristic entirely — no
     // secret ever lands in the 0755 world-readable script.
-    let hcom_env: HashMap<String, String> = env
+    let mut hcom_env: HashMap<String, String> = env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // Visible on the wrapper so herdr detection sees through `hcom pty`.
+    if let Some(kind) = env.get("HERDR_AGENT") {
+        hcom_env.insert("HERDR_AGENT".to_string(), kind.clone());
+    }
     let pane_identity_vars = if run_here {
         std::collections::HashSet::new()
     } else {
@@ -1270,6 +1285,7 @@ pub fn launch_pty(
         .entry("HCOM_TOOL".to_string())
         .or_insert_with(|| tool.to_string());
     runner_env.extend(tool_extra_env(tool));
+    apply_herdr_agent_hint(&mut runner_env, tool);
 
     let script_file =
         create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here)?;
@@ -3369,6 +3385,30 @@ mod tests {
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(env_file).ok();
+    }
+
+    #[test]
+    fn test_background_runner_env_sets_herdr_agent_for_known_kind() {
+        let env = HashMap::new();
+        let omp = background_runner_env("omp", &env, "luna");
+        assert_eq!(omp.get("HERDR_AGENT").map(String::as_str), Some("omp"));
+        let claude = background_runner_env("claude-pty", &env, "luna");
+        assert_eq!(claude.get("HERDR_AGENT").map(String::as_str), Some("claude"));
+        let unknown = background_runner_env("not-a-tool", &env, "luna");
+        assert!(!unknown.contains_key("HERDR_AGENT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_script_exports_herdr_agent_on_wrapper() {
+        let env = HashMap::from([("HERDR_AGENT".to_string(), "omp".to_string())]);
+        let script = create_runner_script("omp", "/tmp", "test", &env, &[], false).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            content.contains("export HERDR_AGENT=omp;"),
+            "wrapper must export HERDR_AGENT so herdr detection sees through hcom pty"
+        );
+        std::fs::remove_file(&script).ok();
     }
 
     // create_runner_script_windows() isn't cfg(windows)-gated (only its call

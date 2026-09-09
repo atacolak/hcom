@@ -915,6 +915,57 @@ pub fn build_env_string(env_vars: &HashMap<String, String>, format_type: &str) -
     }
 }
 
+/// Map an hcom tool id to a herdr occupancy/detection kind.
+///
+/// `None` means herdr has no matching kind; do not invent one. `claude-pty`
+/// is hcom's PTY-hosted Claude; herdr's kind is still `claude`.
+pub(crate) fn herdr_agent_kind(tool: &str) -> Option<&'static str> {
+    match tool {
+        "claude-pty" => Some("claude"),
+        "antigravity" => Some("agy"),
+        other => [
+            "pi",
+            "claude",
+            "codex",
+            "gemini",
+            "cursor",
+            "devin",
+            "agy",
+            "cline",
+            "omp",
+            "mastracode",
+            "opencode",
+            "copilot",
+            "kimi",
+            "kiro",
+            "droid",
+            "amp",
+            "grok",
+            "hermes",
+            "kilo",
+            "qodercli",
+            "qwen",
+            "maki",
+            "muse",
+        ]
+        .into_iter()
+        .find(|&kind| kind == other),
+    }
+}
+
+/// Command typed into a fresh herdr shell pane to start hcom's wrapper.
+///
+/// `herdr agent start --kind X -- extra` prepends the kind's executable, so it
+/// cannot run `hcom pty`. Occupancy is minted by setting `HERDR_AGENT` on the
+/// wrapper (documented herdr wrapper detection) and then `agent.rename` once
+/// the pane is classified.
+fn herdr_pane_run_command(script: &str, tool: &str) -> String {
+    match herdr_agent_kind(tool) {
+        Some(kind) => format!("env HERDR_AGENT={} bash {}", kind, shell_quote(script)),
+        None => format!("bash {}", shell_quote(script)),
+    }
+}
+
 /// Shell-quote a string for bash.
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
@@ -1869,10 +1920,11 @@ fn parse_herdr_pane_id(captured: &str) -> Option<String> {
 }
 
 /// Launch a herdr pane in two steps: `tab create` (whose stdout JSON carries
-/// the new pane id) then `pane run <pane_id> "bash <script>"` to start hcom's
-/// normal runner inside it. Returns `(success, captured_stdout)` where the
-/// captured stdout is the `tab create` envelope — `write_terminal_id` re-parses
-/// the pane id out of it exactly like every other terminal's captured id.
+/// the new pane id) then `pane run <pane_id> "env HERDR_AGENT=<kind> bash
+/// <script>"` to start hcom's runner inside it. Returns `(success,
+/// captured_stdout)` where the captured stdout is the `tab create` envelope
+/// — `write_terminal_id` re-parses the pane id out of it exactly like every
+/// other terminal's captured id.
 fn launch_herdr_two_step(
     create_template: &[String],
     ctx: TerminalCommandContext<'_>,
@@ -1892,7 +1944,9 @@ fn launch_herdr_two_step(
     };
 
     // Step 2: run hcom's generated runner script in the new pane. `pane run`
-    // sends the text and presses Enter, so `bash <script>` is the whole line.
+    // sends the text and presses Enter. Prefix `HERDR_AGENT` so herdr's
+    // wrapper detection classifies `hcom pty` as the real kind; occupancy is
+    // then minted by the delivery loop's `agent.rename` retry.
     // The script path is shell-quoted: herdr types it into the pane's shell,
     // and hcom's launch dir lives under $HOME, which can contain spaces.
     let run_argv = vec![
@@ -1900,7 +1954,7 @@ fn launch_herdr_two_step(
         "pane".to_string(),
         "run".to_string(),
         pane_id.clone(),
-        format!("bash {}", shell_quote(ctx.script)),
+        herdr_pane_run_command(ctx.script, ctx.tool),
     ];
     // Don't `?`-propagate a step-2 failure directly: step 1 already opened the
     // pane, so bailing here would orphan an empty pane that looks like a live
@@ -2228,9 +2282,9 @@ pub fn launch_terminal(
                 .filter(|s| !s.is_empty()),
         };
         // Herdr launches in two steps: `tab create` (stdout carries the pane
-        // id) then `pane run <pane_id> "bash {script}"`. This doesn't fit the
-        // single-argv preset model, so handle it natively. Everything else is a
-        // single spawn.
+        // id) then `pane run` of the HERDR_AGENT-prefixed wrapper. This doesn't
+        // fit the single-argv preset model, so handle it natively. Everything
+        // else is a single spawn.
         let (success, captured_id) = if terminal_mode == "herdr" {
             launch_herdr_two_step(&cmd_template, ctx, inside_ai_tool)?
         } else {
@@ -3548,9 +3602,8 @@ mod tests {
         // The herdr preset opens the pane with `tab create` and a stable
         // `--label {instance_name}` (e.g. `luna`). The runner script is sent
         // separately via `pane run` (handled natively in `launch_terminal`), so
-        // the open argv carries no `{script}` slot. The styled status label
-        // (`◉ luna [claude]`) is pushed via `pane.rename` from the delivery
-        // loop, not baked into the pane label.
+        // the open argv carries no `{script}` slot. Occupancy is not minted
+        // here: `HERDR_AGENT` on the wrapper plus `agent.rename` does that.
         let preset = crate::shared::terminal_presets::get_terminal_preset("herdr").unwrap();
         let open = preset.open.select(false).unwrap();
         assert!(open.contains(&"tab"));
@@ -3558,7 +3611,7 @@ mod tests {
         assert!(
             !open.contains(&"{script}"),
             "herdr's `tab create` open argv must not carry {{script}} — the \
-             runner is sent separately via `pane run`"
+             runner is sent separately via `pane run` with HERDR_AGENT"
         );
         assert!(open.contains(&"{instance_name}"));
         assert!(
@@ -3573,6 +3626,36 @@ mod tests {
         // batch addressing the public id can land on the wrong pane).
         let close = preset.close.select(false).unwrap();
         assert!(close.contains(&"{pane_id}"));
+    }
+
+    #[test]
+    fn test_herdr_agent_kind_maps_hcom_tools() {
+        assert_eq!(herdr_agent_kind("omp"), Some("omp"));
+        assert_eq!(herdr_agent_kind("claude"), Some("claude"));
+        assert_eq!(herdr_agent_kind("claude-pty"), Some("claude"));
+        assert_eq!(herdr_agent_kind("antigravity"), Some("agy"));
+        assert_eq!(herdr_agent_kind("hcom"), None);
+        assert_eq!(herdr_agent_kind("unknown-tool"), None);
+    }
+
+    #[test]
+    fn test_herdr_pane_run_sets_herdr_agent_on_wrapper() {
+        assert_eq!(
+            herdr_pane_run_command("/tmp/run.sh", "omp"),
+            "env HERDR_AGENT=omp bash /tmp/run.sh"
+        );
+        assert_eq!(
+            herdr_pane_run_command("/tmp/run.sh", "claude-pty"),
+            "env HERDR_AGENT=claude bash /tmp/run.sh"
+        );
+        assert_eq!(
+            herdr_pane_run_command("/tmp/run.sh", "hcom"),
+            "bash /tmp/run.sh"
+        );
+        assert_eq!(
+            herdr_pane_run_command("/home/user/My Dir/run.sh", "omp"),
+            "env HERDR_AGENT=omp bash '/home/user/My Dir/run.sh'"
+        );
     }
 
     #[test]

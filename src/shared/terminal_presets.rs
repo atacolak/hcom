@@ -543,14 +543,11 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         // Herdr workspace manager. Launched natively in two steps (see
         // `launch_herdr_two_step` in `terminal.rs`): first this `tab create`
         // opens a pane (its stdout JSON carries the pane id), then
-        // `herdr pane run <pane_id> "bash {script}"` starts hcom's normal
-        // `hcom pty` runner inside it. `agent start` can't be used — current
-        // herdr forces the executable and won't run hcom's wrapper script.
-        // `--label {instance_name}` labels the *tab* (e.g. `luna`) — herdr's
-        // `tab create --label` sets the tab label, not the pane label, which
-        // stays null until the delivery loop's first `pane.rename`. The styled
-        // status label (`◉ luna [claude]`) and the agent state are reported
-        // separately from the delivery loop (`pane.rename` / `pane.report_agent`).
+        // `herdr pane run <pane_id> "env HERDR_AGENT=<kind> bash {script}"`
+        // starts hcom's `hcom pty` runner. `agent start` prepends the kind
+        // executable, so it cannot host the wrapper. `--label {instance_name}`
+        // labels the *tab*. After `HERDR_AGENT` makes detection see through
+        // `hcom pty`, the delivery loop's `agent.rename` mints occupancy.
         (
             "herdr",
             p(
