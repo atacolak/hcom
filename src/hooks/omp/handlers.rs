@@ -231,7 +231,18 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         );
     }
     if ack_mode {
-        if let Some(up_to) = parse_flag(argv, "--up-to") {
+        let ids_flag = parse_flag(argv, "--ids");
+        let up_to_flag = parse_flag(argv, "--up-to");
+        if ids_flag.is_some() && up_to_flag.is_some() {
+            return (
+                0,
+                r#"{"error":"--ids and --up-to are mutually exclusive"}"#.to_string(),
+            );
+        }
+        if let Some(ids_raw) = ids_flag {
+            return ack_by_ids(db, &name, &ids_raw);
+        }
+        if let Some(up_to) = up_to_flag {
             let Ok(ack_id) = up_to.parse::<i64>() else {
                 return (
                     0,
@@ -259,6 +270,9 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         }
         return (0, serde_json::json!({"acked": messages.len()}).to_string());
     }
+    if parse_flag(argv, "--ids").is_some() {
+        return (0, r#"{"error":"--ids requires --ack"}"#.to_string());
+    }
     if check_mode {
         return (
             0,
@@ -268,6 +282,108 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
     (
         0,
         serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+/// Explicit-ids ack: advance the cursor to max(ids), fail-closed.
+///
+/// Ids at/below the cursor are idempotent replays. Every id above the cursor
+/// must be a message event delivered to `name`, and the list must cover the
+/// full unread batch up to its max — a partial ack would silently sweep
+/// unconsumed mail under high-water cursor semantics.
+fn ack_by_ids(db: &HcomDb, name: &str, ids_raw: &str) -> (i32, String) {
+    let mut ids: Vec<i64> = Vec::new();
+    for part in ids_raw.split(',') {
+        let p = part.trim();
+        match p.parse::<i64>() {
+            Ok(id) if id > 0 => ids.push(id),
+            _ => {
+                return (
+                    0,
+                    serde_json::json!({"error": format!("Invalid --ids entry: '{p}'")}).to_string(),
+                );
+            }
+        }
+    }
+    if ids.is_empty() {
+        return (
+            0,
+            r#"{"error":"--ids requires at least one event id"}"#.to_string(),
+        );
+    }
+
+    let current = db.get_cursor(name);
+    let mut fresh: Vec<i64> = Vec::new();
+    let mut already_acked = 0usize;
+    let mut bad: Vec<i64> = Vec::new();
+    for id in ids {
+        if id <= current {
+            already_acked += 1;
+            continue;
+        }
+        let delivered = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE id = ?1 AND type = 'message'",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            .is_some_and(|json| HcomDb::should_deliver_to(&json, name));
+        if delivered {
+            fresh.push(id);
+        } else {
+            bad.push(id);
+        }
+    }
+    if !bad.is_empty() {
+        return (
+            0,
+            serde_json::json!({"error": format!(
+                "--ids not delivered to {name} (or not message events): {bad:?}"
+            )})
+            .to_string(),
+        );
+    }
+
+    // Incomplete-batch guard: every unread delivered message with id <= max(fresh)
+    // must be in the list, or the ack would sweep mail the client never named.
+    if let Some(max_fresh) = fresh.iter().max().copied() {
+        let fresh_set: std::collections::HashSet<i64> = fresh.iter().copied().collect();
+        let missing: Vec<i64> = db
+            .get_unread_messages(name)
+            .iter()
+            .filter_map(|m| m.event_id)
+            .filter(|id| *id <= max_fresh && !fresh_set.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            return (
+                0,
+                serde_json::json!({"error": format!(
+                    "--ids incomplete: unread delivered messages missing from ack: {missing:?}"
+                )})
+                .to_string(),
+            );
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(max_fresh));
+        instances::update_instance_position(db, name, &updates);
+        return (
+            0,
+            serde_json::json!({
+                "acked": fresh.len(),
+                "acked_to": max_fresh,
+                "already_acked": already_acked,
+            })
+            .to_string(),
+        );
+    }
+
+    (
+        0,
+        serde_json::json!({"acked": 0, "acked_to": current, "already_acked": already_acked})
+            .to_string(),
     )
 }
 
@@ -361,4 +477,285 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
         ),
     );
     (exit_code, output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
+    use crate::messages::{DeliveryLane, MessageEnvelope};
+    use crate::shared::{SenderIdentity, SenderKind};
+    use serial_test::serial;
+
+    fn setup() -> (HcomDb, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let db_path = std::env::temp_dir().join(format!(
+            "test_omp_read_ack_{}_{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = HcomDb::open_at(&db_path).unwrap();
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("bob"));
+        row.insert("tool".into(), serde_json::json!("omp"));
+        row.insert("status".into(), serde_json::json!("active"));
+        row.insert("status_context".into(), serde_json::json!(""));
+        row.insert("status_detail".into(), serde_json::json!(""));
+        row.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("bob", &row).unwrap();
+        (db, db_path)
+    }
+
+    fn cleanup(path: std::path::PathBuf) {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn send_to_bob(db: &HcomDb, text: &str) -> i64 {
+        db.log_event(
+            "message",
+            "alice",
+            &serde_json::json!({
+                "from": "alice", "scope": "mentions", "mentions": ["bob"],
+                "text": text, "delivered_to": ["bob"], "delivery": "auto",
+            }),
+        )
+        .unwrap()
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cursor(db: &HcomDb) -> i64 {
+        db.get_cursor("bob")
+    }
+
+    #[test]
+    fn ack_ids_advances_cursor_to_max() {
+        let (db, path) = setup();
+        let a = send_to_bob(&db, "one");
+        let b = send_to_bob(&db, "two");
+        let (code, out) = handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &format!("{a},{b}")]),
+        );
+        assert_eq!(code, 0);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["acked"], 2);
+        assert_eq!(v["acked_to"], b);
+        assert_eq!(cursor(&db), b);
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_ids_idempotent_replay() {
+        let (db, path) = setup();
+        let a = send_to_bob(&db, "one");
+        handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &a.to_string()]),
+        );
+        let (_, out) = handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &a.to_string()]),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["acked"], 0);
+        assert_eq!(v["already_acked"], 1);
+        assert_eq!(cursor(&db), a, "replay must not regress or error");
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_ids_rejects_undelivered_id() {
+        let (db, path) = setup();
+        // message addressed to someone else
+        let other = db
+            .log_event(
+                "message",
+                "alice",
+                &serde_json::json!({
+                    "from": "alice", "scope": "mentions", "mentions": ["nova"],
+                    "text": "not for bob", "delivered_to": ["nova"],
+                }),
+            )
+            .unwrap();
+        let (_, out) = handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &other.to_string()]),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some());
+        assert_eq!(cursor(&db), 0, "cursor must not move on rejection");
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_ids_rejects_non_message_id() {
+        let (db, path) = setup();
+        let life = db
+            .log_event("life", "bob", &serde_json::json!({"action": "started"}))
+            .unwrap();
+        let (_, out) = handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &life.to_string()]),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some());
+        assert_eq!(cursor(&db), 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_ids_rejects_incomplete_batch() {
+        let (db, path) = setup();
+        let a = send_to_bob(&db, "one");
+        let b = send_to_bob(&db, "two");
+        let c = send_to_bob(&db, "three");
+        // ack first and third, skipping the middle: would silently sweep b
+        let (_, out) = handle_read(
+            &db,
+            &argv(&["--name", "bob", "--ack", "--ids", &format!("{a},{c}")]),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some());
+        assert!(v["error"].as_str().unwrap().contains(&b.to_string()));
+        assert_eq!(cursor(&db), 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_ids_and_up_to_conflict() {
+        let (db, path) = setup();
+        let a = send_to_bob(&db, "one");
+        let (_, out) = handle_read(
+            &db,
+            &argv(&[
+                "--name", "bob", "--ack", "--ids", &a.to_string(), "--up-to", "1",
+            ]),
+        );
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some());
+        assert_eq!(cursor(&db), 0);
+        cleanup(path);
+    }
+
+    #[test]
+    fn ids_without_ack_flag_rejected() {
+        let (db, path) = setup();
+        let a = send_to_bob(&db, "one");
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--ids", &a.to_string()]));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some());
+        cleanup(path);
+    }
+
+    #[test]
+    fn ack_up_to_unchanged_regression() {
+        let (db, path) = setup();
+        let _a = send_to_bob(&db, "one");
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--ack", "--up-to", "5"]));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["acked_to"], 5);
+        assert_eq!(cursor(&db), 5);
+        cleanup(path);
+    }
+
+    #[test]
+    fn bare_ack_unchanged_regression() {
+        let (db, path) = setup();
+        let _a = send_to_bob(&db, "one");
+        let b = send_to_bob(&db, "two");
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--ack"]));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["acked"], 2);
+        assert_eq!(cursor(&db), b);
+        cleanup(path);
+    }
+
+    // ---- lane round-trip (Tasks 1+2 through the real handle_read) ----
+
+    fn send_lane_to_bob(db: &HcomDb, lane: DeliveryLane, text: &str) {
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "alice".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            delivery: lane,
+            ..Default::default()
+        };
+        crate::commands::send::send_message(
+            db,
+            &sender,
+            text,
+            Some(&envelope),
+            Some(&["bob".to_string()]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn omp_read_raw_reports_delivery_steer() {
+        let _env = isolated_test_env();
+        let (db, path) = setup();
+        send_lane_to_bob(&db, DeliveryLane::Steer, "steered");
+        let (code, out) = handle_read(&db, &argv(&["--name", "bob"]));
+        assert_eq!(code, 0);
+        let msgs: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(msgs[0]["delivery"], "steer");
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_read_raw_defaults_legacy_rows_to_auto() {
+        let _env = isolated_test_env();
+        let (db, path) = setup();
+        // legacy row: written without the delivery key
+        db.log_event(
+            "message",
+            "alice",
+            &serde_json::json!({
+                "from": "alice", "scope": "mentions", "mentions": ["bob"],
+                "text": "old", "delivered_to": ["bob"],
+            }),
+        )
+        .unwrap();
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob"]));
+        let msgs: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(msgs[0]["delivery"], "auto");
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_read_format_path_agrees_with_raw() {
+        let _env = isolated_test_env();
+        let (db, path) = setup();
+        send_lane_to_bob(&db, DeliveryLane::Queue, "queued");
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--format"]));
+        assert!(
+            out.contains("queue"),
+            "format path must surface the lane: {out}"
+        );
+        assert!(out.contains("queued"));
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_read_format_path_hides_auto() {
+        let _env = isolated_test_env();
+        let (db, path) = setup();
+        send_lane_to_bob(&db, DeliveryLane::Auto, "plain");
+        let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--format"]));
+        assert!(!out.contains("auto"), "auto lane must not add noise: {out}");
+        cleanup(path);
+    }
 }

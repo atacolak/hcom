@@ -234,10 +234,18 @@ const SEND_HELP: &[HelpEntry] = &[
         "",
         "  broadcast + --thread reuses prior thread members; seed with @mentions first",
     ),
+    (
+        "  --delivery <lane>",
+        "Delivery lane: auto | steer | queue (default auto)",
+    ),
     ("", ""),
     ("Sender:", ""),
     ("  --from <name>", "External sender identity (alias: -b)"),
     ("  --name <name>", "Your identity (agent name or UUID)"),
+    (
+        "  --as-instance",
+        "Send as your own bound instance identity (fails if unbound)",
+    ),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
     ("  --title <text>", "Create and attach bundle inline"),
@@ -373,6 +381,17 @@ const STOP_HELP: &[HelpEntry] = &[
     ("stop tag:<name>", "Disconnect all with tag"),
     ("stop all", "Disconnect all agents"),
     ("", ""),
+];
+
+const DISCARD_HELP: &[HelpEntry] = &[
+    ("discard <name>", "Discard a never-committed provisional identity"),
+    ("  --json", "Machine-readable output"),
+    ("  --go", "Confirm when run inside an AI tool"),
+    ("", ""),
+    (
+        "",
+        "Frees the name for reuse; refused once the identity committed work.",
+    ),
 ];
 
 const START_HELP: &[HelpEntry] = &[
@@ -848,6 +867,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "transcript",
     "bundle",
     "kill",
+    "discard",
     "term",
     "relay",
     "run",
@@ -920,6 +940,7 @@ Commands:\n\
   transcript   Read another agent's conversation\n\
   start        Connect to hcom (run inside any AI tool)\n\
   stop         Disconnect from hcom\n\
+  discard      Discard a never-committed provisional identity\n\
   config       Get/set global and per-agent settings\n\
   run          Execute workflow scripts\n\
   relay        Cross-device sync + relay daemon\n\
@@ -1034,6 +1055,7 @@ pub fn get_command_help(name: &str) -> String {
         "send" => Some(SEND_HELP),
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
+        "discard" => Some(DISCARD_HELP),
         "start" => Some(START_HELP),
         "kill" => Some(KILL_HELP),
         "listen" => Some(LISTEN_HELP),
@@ -1146,6 +1168,7 @@ mod tests {
             "list",
             "events",
             "stop",
+            "discard",
             "start",
             "listen",
             "status",

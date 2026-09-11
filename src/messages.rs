@@ -69,6 +69,43 @@ impl std::str::FromStr for MessageIntent {
     }
 }
 
+/// Delivery lane for envelope: how the recipient's client should inject the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliveryLane {
+    /// Client default (today: steer for the OMP plugin).
+    #[default]
+    Auto,
+    /// Interrupt/steer the active turn.
+    Steer,
+    /// Queue without interrupting.
+    Queue,
+}
+
+impl DeliveryLane {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeliveryLane::Auto => "auto",
+            DeliveryLane::Steer => "steer",
+            DeliveryLane::Queue => "queue",
+        }
+    }
+}
+
+impl std::str::FromStr for DeliveryLane {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(DeliveryLane::Auto),
+            "steer" => Ok(DeliveryLane::Steer),
+            "queue" => Ok(DeliveryLane::Queue),
+            _ => Err(format!(
+                "invalid delivery lane: {s} (expected auto|steer|queue)"
+            )),
+        }
+    }
+}
+
 /// Optional envelope fields for messages.
 #[derive(Debug, Clone, Default)]
 pub struct MessageEnvelope {
@@ -76,6 +113,8 @@ pub struct MessageEnvelope {
     pub reply_to: Option<String>,
     pub thread: Option<String>,
     pub bundle_id: Option<String>,
+    /// Always written to event data (unlike the optional siblings above).
+    pub delivery: DeliveryLane,
 }
 
 /// Relay metadata for cross-device messages.
@@ -520,6 +559,17 @@ fn build_message_prefix(msg: &Value) -> String {
         (Some(i), None) => i.to_string(),
         (None, Some(t)) => format!("thread:{}", t),
         (None, None) => "new message".to_string(),
+    };
+
+    // Non-auto delivery lanes are operator-visible routing signals; surface them.
+    let delivery = msg
+        .get("delivery")
+        .and_then(|v| v.as_str())
+        .filter(|d| *d != "auto");
+    let prefix = if let Some(d) = delivery {
+        format!("{d} {prefix}")
+    } else {
+        prefix
     };
 
     if !id_ref.is_empty() {
@@ -1773,5 +1823,31 @@ mod tests {
         assert!(!is_external_sender_data(
             &serde_json::json!({"parent_session_id": "parent-sess"})
         ));
+    }
+
+    // ---- DeliveryLane ----
+
+    #[test]
+    fn delivery_lane_roundtrip() {
+        assert_eq!("auto".parse::<DeliveryLane>().unwrap(), DeliveryLane::Auto);
+        assert_eq!("steer".parse::<DeliveryLane>().unwrap(), DeliveryLane::Steer);
+        assert_eq!("queue".parse::<DeliveryLane>().unwrap(), DeliveryLane::Queue);
+        assert!("bogus".parse::<DeliveryLane>().is_err());
+        assert_eq!(DeliveryLane::default(), DeliveryLane::Auto);
+        assert_eq!(DeliveryLane::Steer.as_str(), "steer");
+    }
+
+    #[test]
+    fn build_message_prefix_shows_non_auto_lane() {
+        let msg = serde_json::json!({"delivery": "steer", "event_id": 42});
+        assert_eq!(build_message_prefix(&msg), "[steer new message #42]");
+    }
+
+    #[test]
+    fn build_message_prefix_hides_auto_lane() {
+        let msg = serde_json::json!({"delivery": "auto", "event_id": 42});
+        assert_eq!(build_message_prefix(&msg), "[new message #42]");
+        let legacy = serde_json::json!({"event_id": 42});
+        assert_eq!(build_message_prefix(&legacy), "[new message #42]");
     }
 }

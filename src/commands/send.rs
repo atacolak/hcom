@@ -92,6 +92,10 @@ pub struct SendArgs {
     #[arg(long)]
     pub thread: Option<String>,
 
+    /// Delivery lane (auto|steer|queue)
+    #[arg(long, value_parser = ["auto", "steer", "queue"])]
+    pub delivery: Option<String>,
+
     // ── Sender ──
     /// External sender identity
     #[arg(long)]
@@ -100,6 +104,10 @@ pub struct SendArgs {
     /// Shorthand for --from bigboss
     #[arg(short = 'b')]
     pub bigboss: bool,
+
+    /// Send as your own bound instance identity (fails if unbound)
+    #[arg(long = "as-instance")]
+    pub as_instance: bool,
 
     /// Suppress output
     #[arg(long)]
@@ -387,6 +395,10 @@ pub fn send_message(
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
     let scope_str = delivery.effective_scope.as_str();
 
+    // Absent envelope (internal callers) still records the default lane: the
+    // contract is that every new message carries an explicit lane.
+    let delivery_lane = envelope.map(|e| e.delivery).unwrap_or_default();
+
     // Build event data
     let mut data = serde_json::json!({
         "from": identity.name,
@@ -398,6 +410,7 @@ pub fn send_message(
         "scope": scope_str,
         "text": message,
         "delivered_to": delivery.delivered_to.clone(),
+        "delivery": delivery_lane.as_str(),
     });
 
     // Add scope extra data (mentions)
@@ -696,6 +709,11 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     }
 
+    if args.as_instance && from_name.is_some() {
+        eprintln!("Error: --as-instance cannot be combined with --from/-b");
+        return 1;
+    }
+
     // Guard: subagents cannot use --from/-b
     if from_name.is_some() {
         let actor_from_ctx = ctx.and_then(|c| c.identity.clone());
@@ -729,6 +747,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
         envelope.intent = val.parse().ok();
+    }
+
+    if let Some(val) = &args.delivery {
+        match val.parse::<crate::messages::DeliveryLane>() {
+            Ok(lane) => envelope.delivery = lane,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+        }
     }
 
     envelope.reply_to = args.reply_to.clone();
@@ -833,7 +861,26 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Resolve sender identity ──
-    let sender_identity = if let Some(ref name) = from_name {
+    let sender_identity = if args.as_instance {
+        let bound = ctx.and_then(|c| {
+            if c.identity_from_binding {
+                c.identity.as_ref()
+            } else {
+                None
+            }
+        });
+        match bound {
+            Some(id) if matches!(id.kind, SenderKind::Instance) && id.instance_data.is_some() => {
+                id.clone()
+            }
+            _ => {
+                eprintln!(
+                    "Error: --as-instance requires your own bound hcom identity. Run 'hcom start' first. No message sent."
+                );
+                return 1;
+            }
+        }
+    } else if let Some(ref name) = from_name {
         SenderIdentity {
             kind: SenderKind::External,
             name: name.clone(),
@@ -1007,10 +1054,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Send message ──
+    // The delivery lane rides on the envelope, so an explicitly requested
+    // non-auto lane must not be discarded when its optional siblings are empty.
     let has_envelope = envelope.intent.is_some()
         || envelope.reply_to.is_some()
         || envelope.thread.is_some()
-        || envelope.bundle_id.is_some();
+        || envelope.bundle_id.is_some()
+        || envelope.delivery != crate::messages::DeliveryLane::Auto;
 
     let delivered_to = match send_message(
         db,
@@ -1732,5 +1782,342 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    // ── --delivery lane ──
+
+    #[test]
+    fn parse_delivery_default_absent() {
+        let args = SendArgs::try_parse_from(["send", "@luna", "--", "hi"]).unwrap();
+        assert_eq!(args.delivery, None);
+    }
+
+    #[test]
+    fn parse_delivery_steer() {
+        let args =
+            SendArgs::try_parse_from(["send", "--delivery", "steer", "@luna", "--", "hi"]).unwrap();
+        assert_eq!(args.delivery.as_deref(), Some("steer"));
+    }
+
+    #[test]
+    fn parse_delivery_invalid_rejected() {
+        let result = SendArgs::try_parse_from(["send", "--delivery", "bogus", "@luna", "--", "hi"]);
+        assert!(result.is_err());
+    }
+
+    // ── --as-instance ──
+
+    #[test]
+    fn parse_as_instance_flag() {
+        let args = SendArgs::try_parse_from(["send", "--as-instance", "@luna", "--", "hi"]).unwrap();
+        assert!(args.as_instance);
+    }
+
+    /// Bound identity context for `luna` — used where a test must prove the
+    /// exclusion/refusal path fires even though `--as-instance` could otherwise
+    /// resolve successfully.
+    fn bound_luna_ctx(db: &HcomDb) -> CommandContext {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-1', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let luna_data = db.get_instance("luna").unwrap().unwrap();
+        CommandContext {
+            explicit_name: None,
+            identity: Some(SenderIdentity {
+                kind: SenderKind::Instance,
+                name: "luna".into(),
+                instance_data: Some(luna_data),
+                session_id: Some("sess-1".into()),
+            }),
+            go: true,
+            identity_from_binding: true,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn as_instance_conflicts_with_from() {
+        let (db, path, _env) = setup_test_db();
+        let ctx = bound_luna_ctx(&db);
+        let mut args =
+            SendArgs::try_parse_from(["send", "--as-instance", "--from", "x", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        let code = cmd_send(&db, &args, Some(&ctx));
+        assert_eq!(code, 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "nothing may be sent on conflict");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_instance_conflicts_with_bigboss() {
+        let (db, path, _env) = setup_test_db();
+        let ctx = bound_luna_ctx(&db);
+        let mut args =
+            SendArgs::try_parse_from(["send", "--as-instance", "-b", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 1);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_instance_uses_bound_identity() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at)
+                 VALUES ('luna', 'sess-1', 1000.0), ('nova', 'sess-2', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let luna_data = db.get_instance("luna").unwrap().unwrap();
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: Some(SenderIdentity {
+                kind: SenderKind::Instance,
+                name: "luna".into(),
+                instance_data: Some(luna_data),
+                session_id: Some("sess-1".into()),
+            }),
+            go: true,
+            identity_from_binding: true,
+        };
+        let mut args =
+            SendArgs::try_parse_from(["send", "--as-instance", "@nova", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        let code = cmd_send(&db, &args, Some(&ctx));
+        assert_eq!(code, 0);
+        let (from, kind): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.from'), json_extract(data, '$.sender_kind')
+                 FROM events WHERE type = 'message'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(from, "luna");
+        assert_eq!(kind, "instance");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_instance_rejects_unbound() {
+        let (db, path, _env) = setup_test_db();
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+            identity_from_binding: false,
+        };
+        let mut args = SendArgs::try_parse_from(["send", "--as-instance", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_instance_rejects_name_only_provenance() {
+        // Identity resolved from a bare --name (no verified actor, no process binding)
+        // is self-assertion, not a binding — must fail closed even though the
+        // identity is a real instance.
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-1', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let luna_data = db.get_instance("luna").unwrap().unwrap();
+        let ctx = CommandContext {
+            explicit_name: Some("luna".into()),
+            identity: Some(SenderIdentity {
+                kind: SenderKind::Instance,
+                name: "luna".into(),
+                instance_data: Some(luna_data),
+                session_id: Some("sess-1".into()),
+            }),
+            go: true,
+            identity_from_binding: false,
+        };
+        let mut args = SendArgs::try_parse_from(["send", "--as-instance", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 1);
+        cleanup_test_db(path);
+    }
+
+    /// A plain send (no intent/thread/reply_to/bundle) must still carry an
+    /// explicitly requested non-auto lane — the lane rides on the envelope, so
+    /// the envelope must not be discarded just because its other fields are empty.
+    #[test]
+    #[serial]
+    fn send_cli_preserves_explicit_lane() {
+        let (db, path, _env) = setup_test_db();
+        let ctx = bound_luna_ctx(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut args =
+            SendArgs::try_parse_from(["send", "--delivery", "steer", "@nova", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 0);
+        let lane: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivery') FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lane, "steer");
+        cleanup_test_db(path);
+    }
+
+    /// Without the `--as-instance` branch, a session with no resolved identity
+    /// but a resolvable `--name` would fall through to the name branch and send
+    /// as that instance. `--as-instance` must never do that.
+    #[test]
+    #[serial]
+    fn as_instance_never_falls_through_to_explicit_name() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-1', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let ctx = CommandContext {
+            explicit_name: Some("luna".into()),
+            identity: None,
+            go: true,
+            identity_from_binding: false,
+        };
+        let mut args = SendArgs::try_parse_from(["send", "--as-instance", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "self-asserted --name must not become the sender");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn from_external_unchanged() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let mut args =
+            SendArgs::try_parse_from(["send", "--from", "reviewer", "@nova", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, None), 0);
+        let kind: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.sender_kind') FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "external");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_stores_delivery_lane() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let envelope = MessageEnvelope {
+            delivery: crate::messages::DeliveryLane::Steer,
+            ..Default::default()
+        };
+        send_message(&db, &sender, "hi", Some(&envelope), Some(&["nova".to_string()])).unwrap();
+        let stored: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivery') FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "steer");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_defaults_delivery_auto() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        send_message(&db, &sender, "hi", None, Some(&["nova".to_string()])).unwrap();
+        let stored: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivery') FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "auto");
+        cleanup_test_db(path);
     }
 }

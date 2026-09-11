@@ -16,6 +16,13 @@ pub(crate) fn flag_path() -> PathBuf {
 }
 
 /// Parse version string "x.y.z" into comparable tuple.
+///
+/// Components must be plain integers. A version that fails to parse reads as
+/// `None`, and `None < Some(_)` makes it look older than every release, so the
+/// update check would advertise a nonexistent update and `hcom update` would
+/// offer to install upstream over this build. Callers therefore must keep
+/// `Cargo.toml`/`pyproject.toml` at plain `x.y.z`; `test_shipped_version_string_is_comparable`
+/// fails the build if they don't.
 fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     let parts: Vec<&str> = v.trim().trim_start_matches('v').split('.').collect();
     if parts.len() >= 3 {
@@ -394,6 +401,24 @@ mod tests {
         assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
         assert_eq!(parse_version("bad"), None);
         assert_eq!(parse_version("1.2"), None);
+    }
+
+    #[test]
+    fn test_shipped_version_string_is_comparable() {
+        // The version actually compiled into this build must survive
+        // parse_version. A `None` here reads as older than every upstream
+        // release, which makes every command print an update notice and makes
+        // `hcom update` offer to install upstream over this build. Guards the
+        // real manifest value, not a sample of it.
+        let current = env!("CARGO_PKG_VERSION");
+        assert!(
+            parse_version(current).is_some(),
+            "CARGO_PKG_VERSION ({current}) is not plain x.y.z and would make the update check misfire"
+        );
+        assert!(
+            parse_version(current) > parse_version("0.7.25"),
+            "this build must rank above the upstream release it forked (0.7.25)"
+        );
     }
 
     #[test]

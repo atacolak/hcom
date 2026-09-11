@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::HcomDb;
+use crate::hooks::test_helpers::plugin_block;
 use crate::instances;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
@@ -153,12 +154,30 @@ fn plugin_delivery_reports_active_edge() {
 }
 
 #[test]
-fn plugin_delivers_pending_mail_as_steer() {
-    // Omitted deliverAs starts a Yield/user turn when idle. Mail must always steer.
-    assert!(PLUGIN_SOURCE.contains("sendUserMessage(formatted, { deliverAs: \"steer\" })"));
-    assert!(!PLUGIN_SOURCE.contains("deliverAs: \"followUp\""));
-    assert!(!PLUGIN_SOURCE.contains("await pi.sendUserMessage(formatted);"));
-    assert!(PLUGIN_SOURCE.contains("ackPending(\"steer\")"));
+fn plugin_acks_pending_delivery_by_exact_ids() {
+    // The lane table itself is pinned BEHAVIOURALLY by the plugin's own bun
+    // suite (`npm run test:plugin`), which drives idle/active x auto/steer/queue
+    // through a fake pi context; no source-text assertion can express that.
+    //
+    // What only cargo can guard is the Rust<->plugin contract. The ack must name
+    // the exact injected batch through `omp-read --ack --ids` (handle_read's new
+    // form) rather than a `--up-to` high-water mark: a held `queue` batch and a
+    // still-unconsumed `followUp` batch can both sit BELOW the newest id, so a
+    // high-water ack advances the cursor past mail the model never saw. That is
+    // the 0.7.25 failure this sprint fixes — a message recorded as delivered to
+    // an actor whose transcript never consumed it.
+    let ack = plugin_block(
+        PLUGIN_SOURCE,
+        "async function ackPending",
+        "\n\tasync function ",
+    );
+    assert!(ack.contains("\"omp-read\""));
+    assert!(ack.contains("--ack"));
+    assert!(ack.contains("--ids"));
+    assert!(
+        PLUGIN_SOURCE.contains("decideInjection"),
+        "lane selection must stay a named, independently testable function"
+    );
 }
 
 // The embedded plugin is include_str!'d and never tsc'd, so these guard the
@@ -166,18 +185,33 @@ fn plugin_delivers_pending_mail_as_steer() {
 // broke before (see PR review). They pin behavior, not just strings.
 
 #[test]
-fn plugin_acks_transform_submission_in_before_agent_start() {
-    // omp applies the bodyless-wake transform inline (no source:"extension"
-    // re-emit), so the transform-path ack must happen in before_agent_start.
-    // Without it pendingAckId stays set and deliverPending jams forever.
-    let idx = PLUGIN_SOURCE
-        .find("pi.on(\"before_agent_start\"")
-        .expect("before_agent_start handler present");
-    assert!(
-        PLUGIN_SOURCE[idx..].contains("ackPending(\"before_agent_start\")"),
-        "before_agent_start must ack the inline transform submission"
-    );
-    assert!(PLUGIN_SOURCE.contains("if (pendingAckId !== null) await ackPending"));
+fn plugin_acks_a_deferred_batch_when_its_consuming_turn_starts() {
+    // A batch injected with an explicit `deliverAs` (the `followUp` lane) cannot
+    // be acked at injection time — its consuming turn may not exist yet. Both
+    // turn starts must therefore ack a tracked batch:
+    //   - `before_agent_start` covers the bodyless-wake transform, which omp
+    //     applies INLINE and never re-emits as an input event with
+    //     source "extension" (so the input handler's extension-ack is dead here);
+    //   - `agent_start` covers the queued-message drain, which does not go
+    //     through `prompt()` and so fires NO `before_agent_start` at all.
+    // Missing either path strands the batch tracked-but-unacked, and the missing
+    // drain-path ack is exactly how 0.7.25 left mail recorded as delivered that
+    // the session never consumed.
+    for event in ["before_agent_start", "agent_start"] {
+        let handler = plugin_block(PLUGIN_SOURCE, &format!("pi.on(\"{event}\""), "\n\tpi.on(");
+        assert!(
+            handler.contains("ackPending("),
+            "the {event} handler must ack the tracked batch"
+        );
+    }
+    // Bounds the slices above (they are not reaching into later handlers) and
+    // pins a real invariant: the hidden bootstrap is a `before_agent_start`
+    // message payload only. Injected from `agent_start` it would have no
+    // delivery channel, and re-injecting per turn would double the prompt.
+    let agent_start = plugin_block(PLUGIN_SOURCE, "pi.on(\"agent_start\"", "\n\tpi.on(");
+    assert!(!agent_start.contains("customType: \"hcom-bootstrap\""));
+    let before_start = plugin_block(PLUGIN_SOURCE, "pi.on(\"before_agent_start\"", "\n\tpi.on(");
+    assert!(before_start.contains("customType: \"hcom-bootstrap\""));
 }
 
 #[test]
@@ -194,21 +228,31 @@ fn plugin_replays_wakes_dropped_during_in_flight_window() {
 }
 
 #[test]
-fn plugin_keeps_ack_gate_until_command_succeeds() {
-    let idx = PLUGIN_SOURCE
-        .find("async function ackPending")
-        .expect("ackPending present");
-    let ack = &PLUGIN_SOURCE[idx..];
-    let command = ack.find("await hcom([\"omp-read\"").expect("ack command");
-    let clear = ack.find("pendingAckId = null").expect("pending ack clear");
+fn plugin_keeps_ack_tracker_until_the_command_succeeds() {
+    // Dropping the tracker on a FAILED ack re-injects mail the model already saw;
+    // dropping it on a rejected one silently loses mail. So it may be cleared
+    // only after a successful call, and both failure shapes must retain it:
+    // a nonzero exit, and the exit-0 `{"error": ...}` body that `--ids`
+    // validation returns for an undelivered id.
+    let ack = plugin_block(
+        PLUGIN_SOURCE,
+        "async function ackPending",
+        "\n\tasync function ",
+    );
+    let command = ack.find("await runHcom(args)").expect("ack command");
+    let clear = ack.find("pendingAck = null").expect("pending ack clear");
     assert!(
         command < clear,
-        "pendingAckId must remain set while the ack command is in flight"
+        "the tracker must remain set while the ack command is in flight"
     );
     assert!(ack.contains("if (result.code !== 0)"));
     assert!(ack.contains("plugin.delivery_ack_failed"));
-    assert!(PLUGIN_SOURCE.contains("ackInFlight"));
-    assert!(PLUGIN_SOURCE.contains("await ackPending(\"reconcile\")"));
+    assert!(ack.contains("ackRejection(result.stdout)"));
+    assert!(ack.contains("plugin.delivery_ack_rejected"));
+    assert!(
+        PLUGIN_SOURCE.contains("ackInFlight"),
+        "concurrent delivery passes must not issue duplicate acks"
+    );
 }
 
 #[test]

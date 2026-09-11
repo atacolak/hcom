@@ -91,6 +91,92 @@ function isBodylessWake(text: string): boolean {
 	return trimmed === "<hcom>" || trimmed === "<hcom></hcom>";
 }
 
+/** A message as returned by `omp-read` (the subset this plugin reads). */
+export type PendingMessage = {
+	event_id?: number;
+	from?: string;
+	message?: string;
+	thread?: string;
+	intent?: string;
+	delivery?: string;
+};
+
+export type DeliveryLane = "auto" | "steer" | "queue";
+
+/** Lane urgency; a batch resolves to its most urgent lane. */
+const LANE_RANK: Record<DeliveryLane, number> = { queue: 1, auto: 2, steer: 3 };
+
+/** `"hold"` = inject nothing and ack nothing. Otherwise the exact `sendUserMessage` options. */
+export type InjectionPlan = "hold" | { deliverAs?: "steer" | "followUp" };
+
+function laneOf(message: PendingMessage): DeliveryLane {
+	// Absent (legacy row) or unknown lane degrades to "auto".
+	if (message.delivery === "steer" || message.delivery === "queue") return message.delivery;
+	return "auto";
+}
+
+/**
+ * Lane-aware plan for one unread batch.
+ *
+ * - `queue` at an idle session is HELD: injecting it would start a turn the
+ *   sender did not ask for. It is delivered by the next trigger that finds a
+ *   turn already in flight (or a bodyless wake carrying it).
+ * - At idle a non-held batch is injected with NO `deliverAs`, so
+ *   `sendUserMessage` takes the `prompt()` path and starts the consuming turn
+ *   synchronously.
+ * - With a turn in flight, `steer` — and any demanding `auto` batch — interrupts
+ *   it; non-demanding `auto` and `queue` wait for the turn to end.
+ */
+export function decideInjection(messages: PendingMessage[], isIdle: boolean): InjectionPlan {
+	if (messages.length === 0) return "hold";
+	let lane: DeliveryLane = "queue";
+	for (const message of messages) {
+		const candidate = laneOf(message);
+		if (LANE_RANK[candidate] > LANE_RANK[lane]) lane = candidate;
+	}
+	if (isIdle) return lane === "queue" ? "hold" : {};
+	// Absent intent is demanding; only an explicit `inform`/`ack` is not.
+	const demanding = messages.some((message) => message.intent !== "inform" && message.intent !== "ack");
+	return lane === "steer" || (lane === "auto" && demanding) ? { deliverAs: "steer" } : { deliverAs: "followUp" };
+}
+
+/**
+ * Exact event ids to name in `omp-read --ack --ids`: every message injected so
+ * far, including a still-unacknowledged earlier batch. The server rejects a
+ * batch that omits an unread message below its high-water id, and it must never
+ * see an id we did not inject.
+ */
+function injectedIds(prior: PendingAck | null, messages: PendingMessage[]): number[] {
+	const ids = new Set<number>(prior?.ids ?? []);
+	for (const message of messages) {
+		const id = Number(message.event_id);
+		if (Number.isInteger(id) && id > 0) ids.add(id);
+	}
+	return [...ids].sort((a, b) => a - b);
+}
+
+/** A batch with `omp-read --ack` still owed. Tracked so the ack names its exact ids. */
+type PendingAck = {
+	ids: number[];
+	/** High-water id, used only when the batch carried no usable ids (`--up-to`). */
+	maxId: number;
+};
+
+/** `omp-read --ack` reports a rejected batch as exit 0 + `{"error": ...}`, cursor untouched. */
+function ackRejection(stdout: string): string | null {
+	try {
+		const json = JSON.parse(stdout || "{}") as { error?: unknown };
+		return typeof json.error === "string" ? json.error : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Test seam: the plugin's only external dependency. */
+export type HcomDeps = {
+	runHcom?: (args: string[]) => Promise<HcomResult>;
+};
+
 // Same-process latch: OMP task subagents load a fresh extension instance in the
 // parent Node process (SessionShutdownEvent has no sessionId). The first binder
 // owns hcom identity; nested instances skip bind/stop so dispose cannot soft-stop
@@ -123,7 +209,8 @@ function clearIdentityOwnership(): void {
 	syncIdentityOwnerEnv(null);
 }
 
-export default function hcomExtension(pi: ExtensionAPI) {
+export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
+	const runHcom = deps.runHcom ?? hcom;
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
 	let ownsIdentity = false;
@@ -133,7 +220,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let notifyServer: Server | null = null;
 	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
-	let pendingAckId: number | null = null;
+	let pendingAck: PendingAck | null = null;
 	let ackInFlight: Promise<boolean> | null = null;
 	let bindingGeneration = 0;
 	let deliveryInFlight = false;
@@ -164,7 +251,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return new Promise((resolve) => {
 			const server = createServer((socket) => {
 				socket.end();
-				log("DEBUG", "notify_server.wake", instanceName, { pending_ack: pendingAckId });
+				log("DEBUG", "notify_server.wake", instanceName, { pending_ack: pendingAck?.ids ?? null });
 				if (currentCtx) void deliverPending(currentCtx);
 			});
 			server.on("error", (error) => {
@@ -202,6 +289,39 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return null;
 	}
 
+	/**
+	 * `omp-start` binds the hcom instance to the session's transcript path. An
+	 * OMP session that was never persisted has no file to hand over, so the bind
+	 * would register an instance pointed at a path that never exists.
+	 *
+	 * `ensureOnDisk` lives on the full `SessionManager`; `ctx.sessionManager` is
+	 * the narrowed `ReadonlySessionManager` Pick, hence the cast — the runtime
+	 * object handed to extensions is the full manager. It silently no-ops when
+	 * persistence is off, so durability is confirmed by the session file, not by
+	 * the resolved promise. Fail closed: log and let a later bind retry
+	 * (bindingPromise is cleared).
+	 */
+	async function ensureSessionDurable(ctx: ExtensionContext): Promise<boolean> {
+		try {
+			const manager = ctx.sessionManager as ExtensionContext["sessionManager"] & {
+				ensureOnDisk?: () => Promise<void>;
+			};
+			if (typeof manager.ensureOnDisk !== "function") {
+				log("WARN", "plugin.session_durability_failed", null, { reason: "ensure_on_disk_unavailable" });
+				return false;
+			}
+			await manager.ensureOnDisk();
+			if (!ctx.sessionManager.getSessionFile()) {
+				log("WARN", "plugin.session_durability_failed", null, { reason: "no_session_file" });
+				return false;
+			}
+			return true;
+		} catch (error) {
+			log("ERROR", "plugin.session_durability_failed", null, { error: String(error) });
+			return false;
+		}
+	}
+
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
@@ -227,13 +347,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					});
 					return;
 				}
+				if (!(await ensureSessionDurable(ctx))) return;
 				const sid = ctx.sessionManager.getSessionId();
 				const transcriptPath = ctx.sessionManager.getSessionFile();
 				const port = await startNotifyServer();
 				const args = ["omp-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
-				const result = await hcom(args);
+				const result = await runHcom(args);
 				if (result.code !== 0) {
 					stopNotifyServer();
 					log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
@@ -267,14 +388,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		await bindingPromise;
 	}
 
-	async function fetchPending(): Promise<{ messages: any[]; maxId: number } | null> {
+	async function fetchPending(): Promise<{ messages: PendingMessage[]; maxId: number } | null> {
 		if (!instanceName) return null;
-		const result = await hcom(["omp-read", "--name", instanceName]);
+		const result = await runHcom(["omp-read", "--name", instanceName]);
 		if (result.code !== 0) {
 			log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
 			return null;
 		}
-		let messages: any[] = [];
+		let messages: PendingMessage[] = [];
 		try {
 			messages = JSON.parse(result.stdout || "[]");
 		} catch (error) {
@@ -282,7 +403,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			return null;
 		}
 		if (!Array.isArray(messages) || messages.length === 0) return null;
-		const maxId = Math.max(...messages.map((m: any) => m.event_id || 0));
+		const maxId = Math.max(...messages.map((m) => m.event_id || 0));
 		if (maxId <= 0) return null;
 		return { messages, maxId };
 	}
@@ -292,14 +413,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		await bindIdentity(ctx);
 		if (!instanceName || !sessionId) return false;
 		if (!isBoundSession(ctx.sessionManager.getSessionId())) return false;
-		if (deliveryInFlight || pendingAckId !== null) {
-			// A delivery is mid-flight or awaiting ack. Drop nothing: record the wake
-			// so it is replayed once clear, otherwise a message that arrives in this
-			// window stays unread until an unrelated later wake (reconcile is idle-gated).
+		if (deliveryInFlight) {
+			// A delivery is mid-flight. Drop nothing: record the wake so it is
+			// replayed once clear, otherwise a message that arrives in this window
+			// stays unread until an unrelated later wake (reconcile is idle-gated).
 			deliveryPending = true;
 			log("DEBUG", "plugin.delivery_skipped", instanceName, {
-				reason: deliveryInFlight ? "delivery_in_flight" : "pending_ack_in_flight",
-				pending_ack: pendingAckId,
+				reason: "delivery_in_flight",
+				pending_ack: pendingAck?.ids ?? null,
 				queued: true,
 			});
 			return false;
@@ -308,23 +429,44 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		try {
 			const pending = await fetchPending();
 			if (!pending) return false;
-			const formatted = formatMessagesForInjection(pending.messages, instanceName);
-			pendingAckId = pending.maxId;
-			try {
-				const isIdle = ctx.isIdle();
-				// Explicit steer: omitted deliverAs starts a Yield/user turn when idle.
-				await pi.sendUserMessage(formatted, { deliverAs: "steer" });
-				const sender = String(pending.messages[0]?.from ?? "");
-				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
-				log("INFO", "plugin.delivery_pending", instanceName, {
-					count: pending.messages.length,
-					pending_ack: pending.maxId,
+			const prior = pendingAck;
+			// A deferred batch is already in the model's context; only newer mail is
+			// injected, and the ack keeps naming both (newest supersedes, oldest is
+			// never silently swept under the cursor).
+			const tracked = new Set(prior?.ids ?? []);
+			const fresh = pending.messages.filter((message) => !tracked.has(Number(message.event_id)));
+			if (fresh.length === 0) return false;
+			const isIdle = ctx.isIdle();
+			const plan = decideInjection(fresh, isIdle);
+			if (plan === "hold") {
+				log("DEBUG", "plugin.delivery_held", instanceName, {
+					count: fresh.length,
+					ids: injectedIds(null, fresh),
 					idle: isIdle,
 				});
-				await ackPending("steer");
+				return false;
+			}
+			const batch: PendingAck = { ids: injectedIds(prior, pending.messages), maxId: pending.maxId };
+			pendingAck = batch;
+			try {
+				const formatted = formatMessagesForInjection(fresh, instanceName);
+				await pi.sendUserMessage(formatted, plan.deliverAs ? { deliverAs: plan.deliverAs } : undefined);
+				const sender = String(fresh[0]?.from ?? "");
+				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
+				log("INFO", "plugin.delivery_pending", instanceName, {
+					count: fresh.length,
+					ids: batch.ids,
+					idle: isIdle,
+					deliver_as: plan.deliverAs ?? null,
+				});
+				// A steer (always into a live run) is consumed by that run's steering
+				// poll; no `deliverAs` means `sendUserMessage` took the `prompt()`
+				// path and the message IS the turn. Either way the batch is consumed
+				// now. A `followUp` waits for the run that drains it.
+				if (plan.deliverAs !== "followUp") await ackPending("delivery");
 				return true;
 			} catch (error) {
-				if (pendingAckId === pending.maxId) pendingAckId = null;
+				if (pendingAck === batch) pendingAck = prior;
 				log("ERROR", "plugin.delivery_send_failed", instanceName, { error: String(error) });
 				return false;
 			}
@@ -334,9 +476,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	// Replay a wake that was queued while delivery was gated. Re-armed once nothing
-	// is mid-flight and no ack is pending, so the same unread batch is not delivered
-	// twice. The microtask + dedup flag collapse a burst of queued wakes into one pass.
+	// Replay a wake that was queued while delivery was gated. The microtask +
+	// dedup flag collapse a burst of queued wakes into one pass.
 	function schedulePendingDelivery(reason: string): void {
 		if (deliveryRetryScheduled) return;
 		deliveryRetryScheduled = true;
@@ -349,34 +490,57 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	function drainPendingDelivery(reason: string): void {
-		if (deliveryPending && !deliveryInFlight && pendingAckId === null) {
+		if (deliveryPending && !deliveryInFlight) {
 			deliveryPending = false;
 			schedulePendingDelivery(reason);
 		}
 	}
 
+	/**
+	 * Ack the tracked batch by its exact ids.
+	 *
+	 * The cursor must never move past mail the model has not seen, so a rejected
+	 * batch (exit 0 + `{"error": ...}`, cursor untouched) leaves the tracker in
+	 * place for a later pass to retry.
+	 */
 	async function ackPending(source: string): Promise<boolean> {
 		if (ackInFlight) return ackInFlight;
-		if (!instanceName || pendingAckId === null) return false;
+		const batch = pendingAck;
+		if (!instanceName || batch === null) return false;
 		const ackInstance = instanceName;
-		const ackId = pendingAckId;
 		const generation = bindingGeneration;
 		const attempt = (async (): Promise<boolean> => {
-			const result = await hcom(["omp-read", "--name", ackInstance, "--ack", "--up-to", String(ackId)]);
+			const args = ["omp-read", "--name", ackInstance, "--ack"];
+			if (batch.ids.length > 0) args.push("--ids", batch.ids.join(","));
+			else args.push("--up-to", String(batch.maxId));
+			const result = await runHcom(args);
 			if (result.code !== 0) {
 				log("WARN", "plugin.delivery_ack_failed", ackInstance, {
-					acked_to: ackId,
+					ids: batch.ids,
 					source,
 					exit_code: result.code,
 					stderr: result.stderr.slice(0, 300),
 				});
 				return false;
 			}
+			const rejection = ackRejection(result.stdout);
+			if (rejection) {
+				log("WARN", "plugin.delivery_ack_rejected", ackInstance, {
+					ids: batch.ids,
+					source,
+					error: rejection,
+				});
+				return false;
+			}
 			// Keep the delivery gate closed until the durable acknowledgement has
 			// succeeded. A reset/rebind invalidates this attempt's local state.
-			if (bindingGeneration === generation && instanceName === ackInstance && pendingAckId === ackId) {
-				pendingAckId = null;
-				log("INFO", "plugin.deferred_ack", ackInstance, { acked_to: ackId, source });
+			if (bindingGeneration === generation && instanceName === ackInstance && pendingAck === batch) {
+				pendingAck = null;
+				log("INFO", "plugin.deferred_ack", ackInstance, {
+					acked: batch.ids.length,
+					acked_to: batch.maxId,
+					source,
+				});
 				drainPendingDelivery("post_ack_wake");
 			}
 			return true;
@@ -395,7 +559,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const args = ["omp-status", "--name", instanceName, "--status", status];
 		if (context) args.push("--context", context);
 		if (detail) args.push("--detail", detail);
-		await hcom(args);
+		await runHcom(args);
 		lastReportedStatusKey = statusKey(status, context, detail);
 	}
 
@@ -423,7 +587,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (reconcileInFlight || !currentCtx || !instanceName) return;
 		reconcileInFlight = true;
 		try {
-			if (pendingAckId !== null) await ackPending("reconcile");
+			// No ack here: a tracked batch is a follow-up whose consuming turn has
+			// not started yet. Reconciling is not consumption.
 			if (currentCtx.isIdle()) {
 				await reportReconciledStatus(currentCtx);
 				await pollPendingIfDue(currentCtx);
@@ -455,7 +620,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		sessionId = null;
 		bootstrapText = null;
 		bindingPromise = null;
-		pendingAckId = null;
+		pendingAck = null;
 		ackInFlight = null;
 		deliveryInFlight = false;
 		deliveryPending = false;
@@ -491,7 +656,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			const stopName = instanceName;
 			let softStopOk = false;
 			try {
-				const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
+				const result = await runHcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
 				if (result.code === 0) {
 					softStopOk = true;
 				} else {
@@ -553,6 +718,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		currentCtx = ctx;
 		clearIdleTimer();
 		agentActive = true;
+		// A tracked batch is a follow-up injected with an explicit `deliverAs`;
+		// its consuming run begins here (the queued-message drain, or a wake
+		// transform). `before_agent_start` fires only inside `prompt()`, so a
+		// follow-up drained at idle would never be acknowledged without this.
+		if (pendingAck !== null) await ackPending("agent_start");
 		await reportStatus(ctx, "active", "agent");
 	});
 
@@ -564,13 +734,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			await ackPending("extension");
 			return {};
 		}
-		if (isBodylessWake(event.text) && pendingAckId === null) {
+		if (isBodylessWake(event.text)) {
 			const pending = await fetchPending();
-			if (pending) {
-				pendingAckId = pending.maxId;
-				return { text: formatMessagesForInjection(pending.messages, instanceName) };
-			}
-			return { handled: true };
+			const prior = pendingAck;
+			const tracked = new Set(prior?.ids ?? []);
+			const fresh = (pending?.messages ?? []).filter((message) => !tracked.has(Number(message.event_id)));
+			if (!pending || fresh.length === 0) return { handled: true };
+			// The submission carrying this wake IS the consuming turn, so even a
+			// `queue` batch held at idle rides the transform instead of starting a
+			// turn of its own.
+			pendingAck = { ids: injectedIds(prior, pending.messages), maxId: pending.maxId };
+			return { text: formatMessagesForInjection(fresh, instanceName) };
 		}
 		await reportStatus(ctx, "active", event.text.trim() === "<hcom>" ? "trigger" : "prompt");
 		return {};
@@ -580,15 +754,13 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
-		// Ack the bodyless-wake transform here. The input handler sets pendingAckId
-		// and returns { text } for a bare <hcom>; omp applies that transform INLINE
-		// and submits it (input-controller.ts) — it never re-emits an input event
-		// with source "extension", so the input handler's extension-ack branch is
-		// dead for the transform path. before_agent_start fires for the submitted
-		// turn, so ack here; otherwise pendingAckId stays set and deliverPending
-		// early-returns forever, permanently jamming delivery. (For the
-		// sendUserMessage path deliverPending already acked, so this no-ops.)
-		if (pendingAckId !== null) await ackPending("before_agent_start");
+		// Ack a tracked batch whose consuming turn is this prompt. The input
+		// handler sets the tracker and returns { text } for a bare <hcom>; omp
+		// applies that transform INLINE and submits it (input-controller.ts) — it
+		// never re-emits an input event with source "extension", so the input
+		// handler's extension-ack branch is dead for the transform path. A
+		// follow-up drained at idle takes the agent_start path instead.
+		if (pendingAck !== null) await ackPending("before_agent_start");
 		if (!bootstrapText) return undefined;
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
@@ -608,7 +780,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
 		await reportStatus(ctx, "active", `tool:${event.toolName}`, String((event.input as any)?.path ?? (event.input as any)?.command ?? ""));
-		const result = await hcom([
+		const result = await runHcom([
 			"omp-beforetool",
 			"--name",
 			instanceName,

@@ -406,6 +406,7 @@ pub fn remove_pi_plugin() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::plugin_block;
     use crate::shared::{ST_ACTIVE, ST_LISTENING};
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -470,12 +471,38 @@ mod tests {
     }
 
     #[test]
-    fn plugin_delivers_pending_mail_as_steer() {
-        // Omitted deliverAs starts a Yield/user turn when idle. Mail must always steer.
-        assert!(PLUGIN_SOURCE.contains("sendUserMessage(formatted, { deliverAs: \"steer\" })"));
-        assert!(!PLUGIN_SOURCE.contains("deliverAs: \"followUp\""));
-        assert!(!PLUGIN_SOURCE.contains("pi.sendUserMessage(formatted);"));
-        assert!(PLUGIN_SOURCE.contains("ackPending(\"sendUserMessage:steer\")"));
+    fn plugin_acks_the_tracked_batch_by_high_water_mark() {
+        // Lane selection is pinned behaviourally by the plugin's own bun suite
+        // (src/pi_plugin/hcom.test.ts). What only cargo can guard is the
+        // Rust<->plugin ack contract, and it differs from omp's on purpose:
+        // `pi-read` has no `--ids` affordance, so pi's only cursor form is the
+        // `--up-to` high-water mark. Both plugins must keep the tracker until the
+        // call succeeds, or a failed ack either re-injects seen mail or loses it.
+        assert!(PLUGIN_SOURCE.contains("decideInjection"));
+        let ack = plugin_block(
+            PLUGIN_SOURCE,
+            "async function ackPending",
+            "\n\tasync function ",
+        );
+        assert!(ack.contains("\"pi-read\""));
+        assert!(ack.contains("--ack"));
+        assert!(ack.contains("--up-to"));
+        assert!(ack.contains("plugin.delivery_ack_failed"));
+
+        // The deferred ack must exist on BOTH turn starts. `before_agent_start` is
+        // not sufficient: the queued-message drain that consumes a `followUp`
+        // at idle does not go through `prompt()` and emits no `before_agent_start`.
+        for event in ["before_agent_start", "agent_start"] {
+            let handler = plugin_block(PLUGIN_SOURCE, &format!("pi.on(\"{event}\""), "\n\tpi.on(");
+            assert!(
+                handler.contains("ackPending("),
+                "the {event} handler must ack the tracked batch"
+            );
+        }
+        // Bounds the slices above, and pins that the hidden bootstrap stays a
+        // `before_agent_start` message payload rather than leaking into agent_start.
+        let agent_start = plugin_block(PLUGIN_SOURCE, "pi.on(\"agent_start\"", "\n\tpi.on(");
+        assert!(!agent_start.contains("customType: \"hcom-bootstrap\""));
     }
 
     #[test]

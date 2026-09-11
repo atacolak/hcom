@@ -17,6 +17,7 @@ pub struct Message {
     pub delivered_to: Option<Vec<String>>,
     pub bundle_id: Option<String>,
     pub relay: bool,
+    pub delivery: String,
 }
 
 impl HcomDb {
@@ -28,7 +29,10 @@ impl HcomDb {
     /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
     /// Mentions compare on base name so the same event JSON routes correctly
     /// on both local and relayed peers without rewriting stored scope.
-    pub(super) fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
+    /// The single delivery predicate for a stored message row. `get_unread_messages`
+    /// and the `omp-read --ack --ids` validator both answer "was this delivered to
+    /// `<receiver>`?" here, so a client can always ack exactly what it was shown.
+    pub(crate) fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
         let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
         if from == receiver {
             return false;
@@ -189,6 +193,11 @@ impl HcomDb {
                     .get("_relay")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let delivery = json
+                    .get("delivery")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("auto")
+                    .to_string();
 
                 messages.push(Message {
                     from,
@@ -200,6 +209,7 @@ impl HcomDb {
                     delivered_to,
                     bundle_id,
                     relay,
+                    delivery,
                 });
             }
         }
@@ -761,6 +771,56 @@ mod tests {
         )
         .unwrap();
         assert!(db.has_direct_unread("luna_reviewer_1"));
+
+        cleanup_test_db(db_path);
+    }
+
+    // ---- DeliveryLane ----
+
+    #[test]
+    fn get_unread_messages_defaults_delivery_auto_for_legacy_rows() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id) VALUES ('bob', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+        // legacy row: data JSON has no "delivery" key
+        db.log_event(
+            "message",
+            "alice",
+            &serde_json::json!({"from": "alice", "scope": "broadcast", "text": "hi"}),
+        )
+        .unwrap();
+
+        let msgs = db.get_unread_messages("bob");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].delivery, "auto");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn get_unread_messages_reads_delivery_lane() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id) VALUES ('bob', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "message",
+            "alice",
+            &serde_json::json!({
+                "from": "alice", "scope": "broadcast", "text": "hi", "delivery": "queue"
+            }),
+        )
+        .unwrap();
+
+        let msgs = db.get_unread_messages("bob");
+        assert_eq!(msgs[0].delivery, "queue");
 
         cleanup_test_db(db_path);
     }

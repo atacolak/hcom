@@ -1,5 +1,12 @@
 # hcom
 
+> **Internal fork.** This is an opinionated, internally-maintained fork of
+> [`aannoo/hcom`](https://github.com/aannoo/hcom). Upstream stays the source of truth for
+> everything documented below; this fork layers extra transport-level capabilities on top for
+> our own multi-agent setups and does not attempt to track upstream release-for-release.
+> It is not a drop-in replacement for downstream consumers of upstream `hcom`. Exactly what
+> differs is listed under [Fork additions](#fork-additions).
+
 [![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
@@ -11,6 +18,35 @@
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
 Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
+
+<details><summary><b>Fork additions</b> (<code>atacolak/hcom</code>)</summary>
+
+This fork adds transport-level capabilities on top of upstream. All are additive; existing
+invocations are unchanged. Fork builds report version `0.7.26`, above the upstream `0.7.25`
+they fork.
+
+- **Delivery lanes.** `hcom send --delivery auto|steer|queue` (default `auto`) carries the
+  caller's intent for *how* a message should reach the receiver, and the lane is recorded
+  on the message envelope. Realization is per receiver state: `queue` never starts an
+  otherwise-idle actor (it is held unread until that actor next runs), `steer` starts one
+  immediately, `auto` defers to hcom's per-intent default.
+- **Exact acks.** `hcom omp-read --name <actor> --ack --ids <id,...>` acks exactly the
+  messages a client consumed. Idempotent, rejects ids that were not delivered to that
+  actor, and refuses an incomplete batch so a partial ack cannot sweep unread mail. The
+  high-water-mark `--ack` form is unchanged for legacy callers.
+- **Actor-attributed send.** `hcom send --as-instance` derives the sender from the caller's
+  own bound actor identity instead of a caller-supplied string, so actor-to-actor traffic is
+  recorded as `tori -> riko` rather than an external proxy. Fails closed when unbound, and
+  is mutually exclusive with `--from`/`-b`.
+- **`hcom discard <name>`.** Retires a provisional identity that never committed any work,
+  freeing its four-letter name for reuse. Distinct from `stop` (name stays resumable) and
+  `kill` (name stays retired): `discard` refuses loudly if the actor has a bound session, a
+  live process, any authored event, an addressed message, a child, or a binding.
+
+The OMP and Pi extensions ship the matching lane-aware delivery and ack logic; a receiver
+running an older extension will still collapse all mail to a steer.
+
+</details>
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 

@@ -7,6 +7,7 @@ pub mod send;
 
 // Lifecycle
 pub mod daemon;
+pub mod discard;
 pub mod fork;
 pub mod kill;
 pub mod launch;

@@ -50,7 +50,11 @@ impl SenderIdentity {
 }
 
 /// Resolved identity context for a single CLI invocation.
-#[derive(Debug, Clone)]
+///
+/// `Default` exists so call sites (and tests) can fill the fields they care
+/// about and let the rest default, which keeps new fields from churning every
+/// literal. Mirrors `TerminalCommandContext`.
+#[derive(Debug, Clone, Default)]
 pub struct CommandContext {
     /// Raw `--name` value (if provided).
     pub explicit_name: Option<String>,
@@ -58,6 +62,10 @@ pub struct CommandContext {
     pub identity: Option<SenderIdentity>,
     /// Whether --go flag was provided.
     pub go: bool,
+    /// True iff `identity` derives from the caller's own binding (verified
+    /// Claude actor capability, or HCOM_PROCESS_ID/Codex auto-detect) rather
+    /// than a self-asserted `--name` lookup.
+    pub identity_from_binding: bool,
 }
 
 #[cfg(test)]

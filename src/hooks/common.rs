@@ -115,6 +115,7 @@ pub(crate) fn message_to_value(m: &Message) -> Value {
     if let Some(id) = m.event_id {
         obj.insert("event_id".into(), serde_json::json!(id));
     }
+    obj.insert("delivery".into(), Value::String(m.delivery.clone()));
     if let Some(ref ts) = m.timestamp {
         obj.insert("timestamp".into(), Value::String(ts.clone()));
     }
@@ -2843,5 +2844,23 @@ mod tests {
             db.get_status("luna").unwrap().map(|(s, _)| s),
             Some(ST_INACTIVE.to_string())
         );
+    }
+
+    #[test]
+    fn message_to_value_includes_delivery() {
+        let m = crate::db::Message {
+            from: "alice".into(),
+            text: "hi".into(),
+            intent: None,
+            thread: None,
+            event_id: Some(7),
+            timestamp: None,
+            delivered_to: None,
+            bundle_id: None,
+            relay: false,
+            delivery: "steer".into(),
+        };
+        let v = message_to_value(&m);
+        assert_eq!(v.get("delivery").and_then(|d| d.as_str()), Some("steer"));
     }
 }

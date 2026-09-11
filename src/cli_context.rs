@@ -20,7 +20,9 @@ use crate::shared::{
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
-const STATUS_SKIP_COMMANDS: &[&str] = &["listen", "start", "stop", "kill", "reset", "status"];
+const STATUS_SKIP_COMMANDS: &[&str] = &[
+    "listen", "start", "stop", "kill", "reset", "status", "discard",
+];
 
 /// Build a CommandContext for a CLI invocation (best-effort identity resolution).
 ///
@@ -44,11 +46,14 @@ pub fn build_ctx_for_command(
         claude_actor::ensure_explicit_matches(db, actor, name)?;
     }
 
+    let mut from_binding = false;
     let identity = if let Some(actor) = verified_actor {
+        from_binding = true;
         Some(actor)
     } else if let Some(name) = explicit_name {
         if cmd != Some("start") {
             // Explicit --name: propagate typed error so router can pattern-match.
+            // Self-asserted, not a caller binding — `--as-instance` must reject it.
             Some(identity::resolve_identity(
                 db,
                 Some(name),
@@ -63,13 +68,17 @@ pub fn build_ctx_for_command(
         }
     } else {
         // No explicit name: best-effort, swallow errors
-        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok()
+        let id =
+            identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok();
+        from_binding = id.is_some();
+        id
     };
 
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
         identity,
         go,
+        identity_from_binding: from_binding,
     })
 }
 
@@ -578,6 +587,7 @@ mod tests {
         assert!(ctx.identity.is_some());
         assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
         assert_eq!(ctx.explicit_name.as_deref(), Some("luna"));
+        assert!(!ctx.identity_from_binding, "bare --name is self-assertion");
     }
 
     #[test]
@@ -600,6 +610,7 @@ mod tests {
             build_ctx_for_command(&db, Some("send"), None, false, Some("pid-1"), None).unwrap();
         assert!(ctx.identity.is_some());
         assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
+        assert!(ctx.identity_from_binding, "process binding is the caller's own binding");
     }
 
     #[test]
@@ -615,6 +626,17 @@ mod tests {
         // "garbage" doesn't exist — explicit --name must propagate error
         let result = build_ctx_for_command(&db, Some("send"), Some("garbage"), false, None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_ctx_marks_explicit_name_as_not_from_binding() {
+        // explicit --name with no verified actor: identity resolves but is self-asserted
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "claude");
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("luna"), false, None, None).unwrap();
+        assert!(ctx.identity.is_some());
+        assert!(!ctx.identity_from_binding);
     }
 
     #[test]
@@ -634,6 +656,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         assert!(check_identity_gate("list", &ctx, false, false).is_ok());
     }
@@ -644,6 +667,7 @@ mod tests {
             explicit_name: Some("luna".to_string()),
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -654,6 +678,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         assert!(check_identity_gate("send", &ctx, true, false).is_ok());
     }
@@ -664,6 +689,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         let err = check_identity_gate("send", &ctx, false, false).unwrap_err();
         assert!(err.contains("identity not found"));
@@ -680,6 +706,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -690,6 +717,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         let err = check_identity_gate("listen", &ctx, false, true).unwrap_err();
         assert!(err.contains("start --as"));
@@ -710,6 +738,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         // listen is in skip list — should not change status
         set_hookless_command_status(&db, "listen", &ctx);
@@ -731,6 +760,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -751,6 +781,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         set_hookless_command_status(&db, "events", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -771,6 +802,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -797,6 +829,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("sub1").unwrap().unwrap();
@@ -937,6 +970,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         assert!(maybe_deliver_pending_messages(&db, &ctx, true).is_none());
     }
@@ -953,6 +987,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_from_binding: false,
         };
         assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
     }
@@ -964,6 +999,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_from_binding: false,
         };
         assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
     }

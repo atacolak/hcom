@@ -36,6 +36,29 @@ pub mod test_helpers {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Slice an embedded-plugin source range: from the first `start` to the next
+    /// `until` (or EOF).
+    ///
+    /// The embedded plugins are `include_str!`'d and never type-checked by
+    /// cargo, so their test modules assert on source text. Bounding the slice is
+    /// what keeps such an assertion honest: with a bare
+    /// `source[idx..].contains(x)` the match may come from ANY later construct,
+    /// so the assertion passes for the wrong handler.
+    ///
+    /// Call sites pass explicit markers — e.g.
+    /// `plugin_block(PLUGIN_SOURCE, "pi.on(\"agent_start\"", "\n\tpi.on(")` — so
+    /// the bound is visible at the assertion rather than hidden in a helper.
+    pub fn plugin_block<'a>(source: &'a str, start: &str, until: &str) -> &'a str {
+        let idx = source
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} present"));
+        let rest = &source[idx..];
+        match rest[1..].find(until) {
+            Some(offset) => &rest[..offset + 1],
+            None => rest,
+        }
+    }
+
     /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
     pub struct EnvGuard {
         saved_hcom: Option<String>,
