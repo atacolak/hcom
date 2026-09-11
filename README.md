@@ -7,19 +7,7 @@
 > It is not a drop-in replacement for downstream consumers of upstream `hcom`. Exactly what
 > differs is listed under [Fork additions](#fork-additions).
 
-[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
-
-> **Hook your coding agents together**
-
-`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Gemini and Copilot - in any combination, without changing how you use them.
-
-Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
-
-Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
-
-<details><summary><b>Fork additions</b> (<code>atacolak/hcom</code>)</summary>
+## Fork additions
 
 This fork adds transport-level capabilities on top of upstream. All are additive; existing
 invocations are unchanged. Fork builds report version `0.7.26`, above the upstream `0.7.25`
@@ -46,7 +34,17 @@ they fork.
 The OMP and Pi extensions ship the matching lane-aware delivery and ack logic; a receiver
 running an older extension will still collapse all mail to a steer.
 
-</details>
+[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
+
+> **Hook your coding agents together**
+
+`hcom` is a CLI that coding agents use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Gemini and Copilot - in any combination, without changing how you use them.
+
+Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
+
+Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
