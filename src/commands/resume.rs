@@ -380,6 +380,55 @@ fn prepare_resume_plan_from_source(
     }
 
     validate_resume_operation(&tool, fork)?;
+
+    // A tracked snapshot outlives its transcript more often than the snapshot
+    // implies: session files get pruned, rotated, or deleted by hand, and a
+    // launch that dies before its extension binds records a session id that
+    // never existed at all. Replaying `--resume <id>` then kills the relaunch on
+    // the tool's first breath ("Session not found"), so the instance never
+    // reaches ready and the operator ends up with no session whatsoever.
+    //
+    // Recovery order: the current bound session if it is recoverable; else walk
+    // this actor's historical HCOM session bindings newest -> oldest and take
+    // the first whose transcript is still on disk. Recency is authority, not
+    // recording frequency. Only if no historical binding survives do we mint
+    // a fresh session under the same hcom name.
+    let mut recovery_dir: Option<String> = None;
+    let resume_session: Option<String> =
+        if !is_adoption && transcript_provably_gone(&tool, &session_id) {
+            if fork {
+                bail!(
+                    "Transcript for '{}' (session {}) is gone from disk — cannot fork. \
+                     Run `hcom r {}` to start a fresh session under the same name.",
+                    display_name,
+                    session_id,
+                    display_name
+                );
+            }
+            match recoverable_session_from_history(db, &display_name, &tool, Some(&session_id)) {
+                Some((prior_sid, prior_dir)) => {
+                    eprintln!(
+                        "Warning: transcript for '{}' (session {}) is gone from disk; \
+                         resuming the most recent recoverable session {}",
+                        display_name, session_id, prior_sid
+                    );
+                    recovery_dir = prior_dir;
+                    Some(prior_sid)
+                }
+                None => {
+                    eprintln!(
+                        "Warning: transcript for '{}' (session {}) is gone from disk and no \
+                         recoverable session remains; starting a fresh {} session under the \
+                         same hcom name",
+                        display_name, session_id, tool
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(session_id.clone())
+        };
+
     let inherited_tag = if tag.is_empty() {
         None
     } else {
@@ -388,6 +437,13 @@ fn prepare_resume_plan_from_source(
 
     // Extract hcom-level flags from extra args before tool parsing.
     let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
+
+    // The snapshot directory belongs to the session that just turned out to be
+    // a corpse; when a recoverable session was substituted, its own recorded
+    // directory is the one that still holds that conversation's cwd.
+    let snapshot_dir = recovery_dir
+        .filter(|dir| std::path::Path::new(dir).is_dir())
+        .unwrap_or(snapshot_dir);
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -429,7 +485,11 @@ fn prepare_resume_plan_from_source(
     let mut persisted_args = original_args.clone();
     persisted_args.extend(clean_extra.iter().cloned());
 
-    let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
+    let mut cli_tool_args = match &resume_session {
+        Some(session_id) => build_resume_args(&tool, session_id, fork),
+        // Fresh fallback: no --resume/--fork injection at all.
+        None => Vec::new(),
+    };
     cli_tool_args.extend(clean_extra);
 
     let merged_cli_args = if !original_args.is_empty() {
@@ -539,8 +599,9 @@ fn prepare_resume_plan_from_source(
             args: merged_args,
             persisted_args: Some(persisted_args),
             // Forks start a new session on first turn; only plain resume
-            // inherits the prior id so kill-before-bind stays resumable.
-            prior_session_id: (!fork).then(|| session_id.clone()),
+            // inherits the prior id so kill-before-bind stays resumable. A
+            // resume that fell back to a fresh session has no id to seed.
+            prior_session_id: if fork { None } else { resume_session.clone() },
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             initial_prompt: fork_initial_prompt,
@@ -559,7 +620,7 @@ fn prepare_resume_plan_from_source(
             append_reply_handoff,
         },
         last_event_id,
-        session_id,
+        session_id: resume_session.unwrap_or_default(),
         tracked_fork_identity,
     })
 }
@@ -600,7 +661,14 @@ fn execute_prepared_resume(
             &format!("cmd.{}", if fork { "fork" } else { "resume" }),
             &format!(
                 "name={} tool={} session={} launched={}",
-                name, plan.output.tool, plan.session_id, result.launched
+                name,
+                plan.output.tool,
+                if plan.session_id.is_empty() {
+                    "fresh"
+                } else {
+                    plan.session_id.as_str()
+                },
+                result.launched
             ),
         );
         return Ok(crate::commands::launch::readiness_exit_code(
@@ -988,8 +1056,7 @@ fn load_stopped_snapshot(
 fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
     use crate::integration_spec::{ForkArgs, ResumeArgs};
     // claude-pty resolves to the Claude spec.
-    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
-    let Ok(tool_enum) = tool_lookup.parse::<crate::tool::Tool>() else {
+    let Ok(tool_enum) = normalize_tool_alias(tool).parse::<crate::tool::Tool>() else {
         return Vec::new();
     };
     let Some(resume_spec) = tool_enum.spec().resume.as_ref() else {
@@ -1691,6 +1758,116 @@ fn lookup_family_session(session_id: &str) -> Option<(String, String)> {
     ["opencode", "kilo"].into_iter().find_map(|tool| {
         lookup_opencode_family_session(tool, session_id).map(|cwd| (tool.to_string(), cwd))
     })
+}
+
+/// Walk this actor's historical session ids newest -> oldest and return the
+/// first whose transcript is still on disk.
+///
+/// Recency is authority. A newer session recorded once beats an older session
+/// recorded many times: the operator's last successful `/resume` is the
+/// conversation they meant to keep, even if an earlier one accumulated more
+/// stop snapshots. Frequency ranking is what turned a vanished `/tmp` binding
+/// into a resume of the wrong (older, more-recorded) conversation.
+///
+/// History is assembled from `life.stopped` snapshots (newest event id first)
+/// plus `session_bindings` for this instance. Bindings that only exist as a
+/// current row and never produced a stop event still participate, ranked by
+/// `created_at`. Duplicate session ids keep the newest occurrence.
+///
+/// `skip` is the vanished current id so we never re-select the corpse we just
+/// rejected. Conservative probing is inherited from `find_session_on_disk` /
+/// `transcript_provably_gone`: only Pi/OMP misses are authoritative, so a
+/// history row for a tool whose store hcom cannot enumerate is treated as
+/// present rather than discarded.
+fn recoverable_session_from_history(
+    db: &HcomDb,
+    name: &str,
+    tool: &str,
+    skip: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<(String, Option<String>)> = Vec::new();
+
+    if let Some(stmt) = db
+        .conn()
+        .prepare(
+            "SELECT json_extract(data, '$.snapshot.session_id'),
+                    json_extract(data, '$.snapshot.directory'),
+                    json_extract(data, '$.snapshot.tool')
+             FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC",
+        )
+        .ok()
+    {
+        let mut stmt = stmt;
+        if let Ok(rows) = stmt.query_map([name], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        }) {
+            for (sid, dir, row_tool) in rows.flatten() {
+                let Some(sid) = sid else { continue };
+                if sid.is_empty() || skip == Some(sid.as_str()) {
+                    continue;
+                }
+                if normalize_tool_alias(row_tool.as_deref().unwrap_or(tool))
+                    != normalize_tool_alias(tool)
+                {
+                    continue;
+                }
+                if seen.insert(sid.clone()) {
+                    ordered.push((sid, dir));
+                }
+            }
+        }
+    }
+
+    // Bindings that never produced a stop event still count as history. Rank
+    // them after stop-snapshots of equal recency by appending, then skip ids
+    // already seen from events.
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT session_id FROM session_bindings
+         WHERE instance_name = ?
+         ORDER BY created_at DESC",
+    ) {
+        if let Ok(rows) = stmt.query_map([name], |row| row.get::<_, String>(0)) {
+            for sid in rows.flatten() {
+                if sid.is_empty() || skip == Some(sid.as_str()) {
+                    continue;
+                }
+                if seen.insert(sid.clone()) {
+                    ordered.push((sid, None));
+                }
+            }
+        }
+    }
+
+    ordered.into_iter().find(|(sid, _)| {
+        find_session_on_disk(sid).is_some() || ambiguous_pi_omp_session(sid).is_some()
+    })
+}
+
+/// `claude-pty` and `claude` share one transcript store; every other tool name
+/// is already its own.
+fn normalize_tool_alias(tool: &str) -> &str {
+    if tool == "claude-pty" { "claude" } else { tool }
+}
+
+/// Whether a tracked resume's transcript has provably vanished from disk.
+///
+/// Only Pi/OMP are probed: their session roots are exclusive and enumerable, so
+/// a miss is authoritative. For every other tool hcom cannot tell "the
+/// transcript is gone" from "it lives somewhere this build does not look", and
+/// dropping `--resume` there would silently discard real conversation history.
+/// A session found in a markerless shared root (`PiOmpMatch::Ambiguous`) does
+/// exist, so it counts as present.
+fn transcript_provably_gone(tool: &str, session_id: &str) -> bool {
+    matches!(tool, "omp" | "pi") && matches!(resolve_pi_omp_on_disk(session_id), PiOmpMatch::None)
 }
 
 /// Resolve a session ID to the owning tool and (optionally) a pre-recovered
@@ -3168,6 +3345,223 @@ mod tests {
             fork.launch.prior_session_id, None,
             "forks bind a fresh session on first turn; must not inherit the parent's"
         );
+    }
+
+    /// Seed a stopped OMP instance: inactive row + `stopped` life snapshot.
+    fn seed_stopped_omp_instance(db: &HcomDb, name: &str, session_id: &str) {
+        seed_stopped_session(db, name, session_id, "/tmp");
+    }
+
+    /// Seed one `stopped` life snapshot for `name` in `directory`. Each call
+    /// inserts a new event row, so later calls are newer (ORDER BY id DESC).
+    fn seed_stopped_session(db: &HcomDb, name: &str, session_id: &str, directory: &str) {
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!(session_id));
+        data.insert("tool".into(), json!("omp"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named(name, &data).unwrap();
+
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "omp",
+                "session_id": session_id,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": directory
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", name, snapshot.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// Point the OMP session root at an isolated HOME so transcript presence is
+    /// decided by the fixture, not by whatever sessions this machine holds.
+    #[cfg(unix)]
+    fn isolated_omp_root() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    ) {
+        let (dir, _hcom, home, guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+        }
+        (dir, home, guard)
+    }
+
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, which Windows ignores for `dirs::home_dir()`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_resume_vanished_omp_transcript_starts_fresh_under_same_name() {
+        let (_dir, _home, _guard) = isolated_omp_root();
+        let db = test_db();
+        let ghost = "01a0948d-dead-7000-8000-000000000000";
+        seed_stopped_omp_instance(&db, "tori", ghost);
+
+        let plan = prepare_resume_plan(&db, "tori", false, &[], &GlobalFlags::default()).unwrap();
+
+        assert!(
+            !plan.launch.args.iter().any(|arg| arg.contains(ghost)),
+            "a vanished transcript must not be replayed as --resume, got {:?}",
+            plan.launch.args
+        );
+        assert_eq!(
+            plan.launch.prior_session_id, None,
+            "a fallback launch must not pre-seed the dead session id"
+        );
+        assert_eq!(
+            plan.launch.name.as_deref(),
+            Some("tori"),
+            "the fallback keeps the hcom identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_resume_live_omp_transcript_keeps_the_session_id() {
+        let (_dir, home, _guard) = isolated_omp_root();
+        let sid = "01a0948d-live-7000-8000-000000000001";
+        let root = home
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(format!("2026-01-01T00-00-00.000Z_{sid}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let db = test_db();
+        seed_stopped_omp_instance(&db, "tori", sid);
+
+        let plan = prepare_resume_plan(&db, "tori", false, &[], &GlobalFlags::default()).unwrap();
+
+        assert!(
+            plan.launch.args.contains(&sid.to_string()),
+            "an on-disk transcript must be resumed, got {:?}",
+            plan.launch.args
+        );
+        assert_eq!(plan.launch.prior_session_id.as_deref(), Some(sid));
+    }
+
+    // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
+    // $HOME, which Windows ignores for `dirs::home_dir()`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_resume_ghost_snapshot_recovers_the_newest_surviving_session() {
+        let (dir, home, _guard) = isolated_omp_root();
+        // Exact tori-shaped incident: A recorded many times, B the later
+        // intentional /resume (once), C the vanished /tmp binding.
+        let older = "01a0756e-131e-7000-ae7d-d9fdd467544d";
+        let newer = "01a0756e-intentional-resume-once";
+        let ghost = "01a0948d-c040-7000-8c1f-9ba35aa63769";
+        let root = home
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join("-workspace-voicecat");
+        std::fs::create_dir_all(&root).unwrap();
+        for sid in [older, newer] {
+            std::fs::write(
+                root.join(format!("2026-09-06T06-35-43-262Z_{sid}.jsonl")),
+                "{}",
+            )
+            .unwrap();
+        }
+
+        let older_dir = dir.path().join("talker");
+        let newer_dir = dir.path().join("voicecat");
+        std::fs::create_dir_all(&older_dir).unwrap();
+        std::fs::create_dir_all(&newer_dir).unwrap();
+
+        let db = test_db();
+        // A: older conversation, recorded 20 times.
+        for _ in 0..20 {
+            seed_stopped_session(&db, "tori", older, older_dir.to_str().unwrap());
+        }
+        // B: newer intentional OMP /resume, recorded once.
+        seed_stopped_session(&db, "tori", newer, newer_dir.to_str().unwrap());
+        // C: latest temporary binding, now missing from disk.
+        seed_stopped_session(&db, "tori", ghost, older_dir.to_str().unwrap());
+
+        let plan = prepare_resume_plan(&db, "tori", false, &[], &GlobalFlags::default()).unwrap();
+
+        assert!(
+            !plan.launch.args.iter().any(|arg| arg.contains(ghost)),
+            "the corpse session id must never be replayed, got {:?}",
+            plan.launch.args
+        );
+        assert!(
+            plan.launch.args.contains(&newer.to_string()),
+            "C missing must resume B (newest surviving), not A (more recordings), got {:?}",
+            plan.launch.args
+        );
+        assert_eq!(plan.launch.prior_session_id.as_deref(), Some(newer));
+        assert_eq!(
+            plan.launch.cwd.as_deref(),
+            newer_dir.to_str(),
+            "the recovered session's own directory must win over the corpse's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_resume_ghost_snapshot_recovers_tori_shaped_older_when_it_is_newest_surviving() {
+        let (dir, home, _guard) = isolated_omp_root();
+        let real = "01a0756e-131e-7000-ae7d-d9fdd467544d";
+        let ghost = "01a0948d-c040-7000-8c1f-9ba35aa63769";
+        let root = home
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join("-workspace-voicecat");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(format!("2026-09-06T06-35-43-262Z_{real}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let real_dir = dir.path().join("voicecat");
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let db = test_db();
+        seed_stopped_session(&db, "tori", real, real_dir.to_str().unwrap());
+        seed_stopped_session(&db, "tori", ghost, "/tmp/ompsess");
+
+        let plan = prepare_resume_plan(&db, "tori", false, &[], &GlobalFlags::default()).unwrap();
+
+        assert!(
+            !plan.launch.args.iter().any(|arg| arg.contains(ghost)),
+            "the corpse session id must never be replayed, got {:?}",
+            plan.launch.args
+        );
+        assert!(
+            plan.launch.args.contains(&real.to_string()),
+            "C missing and B absent must resume A, got {:?}",
+            plan.launch.args
+        );
+        assert_eq!(plan.launch.prior_session_id.as_deref(), Some(real));
+        assert_eq!(plan.launch.cwd.as_deref(), real_dir.to_str());
     }
 
     #[test]
