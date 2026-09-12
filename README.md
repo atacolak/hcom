@@ -15,9 +15,11 @@ they fork.
 
 - **Delivery lanes.** `hcom send --delivery auto|steer|queue` (default `auto`) carries the
   caller's intent for *how* a message should reach the receiver, and the lane is recorded
-  on the message envelope. Realization is per receiver state: `queue` never starts an
-  otherwise-idle actor (it is held unread until that actor next runs), `steer` starts one
-  immediately, `auto` defers to hcom's per-intent default.
+  on the message envelope. Realization is per receiver state: `queue` neither starts an
+  otherwise-idle actor nor interrupts a turn (the message is held unread until that actor
+  next runs); `steer` starts one and interrupts whatever is in flight; `auto` starts an
+  idle actor like `steer`, but with a turn already in flight it interrupts only for a
+  demanding intent — `inform` and `ack` wait for the turn to end.
 - **Exact acks.** `hcom omp-read --name <actor> --ack --ids <id,...>` acks exactly the
   messages a client consumed. Idempotent, rejects ids that were not delivered to that
   actor, and refuses an incomplete batch so a partial ack cannot sweep unread mail. The
