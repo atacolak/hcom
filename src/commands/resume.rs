@@ -645,7 +645,7 @@ fn execute_prepared_resume(
             launcher_name: &plan.output.launcher_name,
             terminal: plan.output.terminal.as_deref(),
             background: plan.output.background,
-            run_here: plan.output.run_here,
+            run_here: effective_resume_run_here(plan, name),
             hcom_config,
             inline_readiness_wait_secs,
         };
@@ -722,6 +722,9 @@ fn execute_prepared_resume_result(
 
 fn prepare_launch_for_execution(db: &HcomDb, plan: &PreparedResume) -> Result<LaunchParams> {
     let mut launch = plan.launch.clone();
+    if let Some(name) = launch.name.clone() {
+        launch.run_here = effective_resume_run_here(plan, &name);
+    }
     let Some(identity) = &plan.tracked_fork_identity else {
         return Ok(launch);
     };
@@ -803,6 +806,37 @@ fn should_preview_resume_rpc(extra_args: &[String]) -> bool {
     let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
     let _ = dir_override;
     should_preview_resume(&launch_flags, &clean_extra)
+}
+
+/// `hcom r <name>` typed in that actor's own herdr pane after a crash must
+/// exec in THIS pane. Leftover `HCOM_LAUNCHED=1` otherwise makes
+/// `will_run_in_current_terminal` return false and `herdr tab create` mints
+/// a sibling. Explicit `--run-here` / `--no-run-here` still wins. Forks and
+/// resumes of a *different* name still open a new window.
+fn should_run_here_in_own_herdr_pane(
+    resume_name: &str,
+    instance_name: Option<&str>,
+    herdr_pane_id: Option<&str>,
+) -> bool {
+    let Some(instance) = instance_name.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    herdr_pane_id.filter(|s| !s.is_empty()).is_some() && instance == resume_name
+}
+
+fn effective_resume_run_here(plan: &PreparedResume, name: &str) -> Option<bool> {
+    if plan.launch.run_here.is_some() || plan.tracked_fork_identity.is_some() {
+        return plan.launch.run_here;
+    }
+    let instance = std::env::var("HCOM_INSTANCE_NAME")
+        .ok()
+        .or_else(|| std::env::var("HCOM_NAME").ok());
+    let pane = std::env::var("HERDR_PANE_ID").ok();
+    if should_run_here_in_own_herdr_pane(name, instance.as_deref(), pane.as_deref()) {
+        Some(true)
+    } else {
+        plan.launch.run_here
+    }
 }
 
 /// Extract resume-only flags, then reuse the shared launch flag parser.
@@ -3264,6 +3298,28 @@ mod tests {
             ..Default::default()
         };
         assert!(should_preview_resume(&flags, &[]));
+    }
+
+    #[test]
+    fn test_self_resume_in_own_herdr_pane_after_crash() {
+        assert!(should_run_here_in_own_herdr_pane(
+            "midi",
+            Some("midi"),
+            Some("w24:p79")
+        ));
+        assert!(
+            !should_run_here_in_own_herdr_pane("luna", Some("midi"), Some("w24:p79")),
+            "resuming a different name must not steal this pane"
+        );
+        assert!(
+            !should_run_here_in_own_herdr_pane("midi", Some("midi"), None),
+            "no herdr pane => do not infer run-here"
+        );
+        assert!(!should_run_here_in_own_herdr_pane(
+            "midi",
+            None,
+            Some("w24:p79")
+        ));
     }
 
     #[test]
