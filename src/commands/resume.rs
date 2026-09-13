@@ -808,20 +808,27 @@ fn should_preview_resume_rpc(extra_args: &[String]) -> bool {
     should_preview_resume(&launch_flags, &clean_extra)
 }
 
-/// `hcom r <name>` typed in that actor's own herdr pane after a crash must
-/// exec in THIS pane. Leftover `HCOM_LAUNCHED=1` otherwise makes
-/// `will_run_in_current_terminal` return false and `herdr tab create` mints
-/// a sibling. Explicit `--run-here` / `--no-run-here` still wins. Forks and
-/// resumes of a *different* name still open a new window.
+/// `hcom r <name>` typed in a herdr pane must exec in THIS pane, not mint a
+/// sibling tab. Leftover `HCOM_LAUNCHED=1` / `HCOM_TOOL` otherwise makes
+/// `inside_ai_tool` true, `will_run_in_current_terminal` false, and
+/// `herdr tab create` fires.
+///
+/// - Human shell in herdr (no HCOM_INSTANCE_NAME): infer --run-here.
+/// - Crash self-resume (HCOM_INSTANCE_NAME matches the target): infer --run-here.
+/// - Live agent resuming a *different* name: still open a new window.
+/// Explicit `--run-here` / `--no-run-here` still wins. Forks do not infer.
 fn should_run_here_in_own_herdr_pane(
     resume_name: &str,
     instance_name: Option<&str>,
     herdr_pane_id: Option<&str>,
 ) -> bool {
-    let Some(instance) = instance_name.filter(|s| !s.is_empty()) else {
+    if herdr_pane_id.filter(|s| !s.is_empty()).is_none() {
         return false;
-    };
-    herdr_pane_id.filter(|s| !s.is_empty()).is_some() && instance == resume_name
+    }
+    match instance_name.filter(|s| !s.is_empty()) {
+        None => true,
+        Some(instance) => instance == resume_name,
+    }
 }
 
 fn effective_resume_run_here(plan: &PreparedResume, name: &str) -> Option<bool> {
@@ -3308,18 +3315,21 @@ mod tests {
             Some("w24:p79")
         ));
         assert!(
+            should_run_here_in_own_herdr_pane("dani", None, Some("w20:pE")),
+            "human herdr shell with no HCOM_INSTANCE_NAME must occupy the calling pane"
+        );
+        assert!(
             !should_run_here_in_own_herdr_pane("luna", Some("midi"), Some("w24:p79")),
-            "resuming a different name must not steal this pane"
+            "resuming a different name from a live agent must not steal this pane"
         );
         assert!(
             !should_run_here_in_own_herdr_pane("midi", Some("midi"), None),
             "no herdr pane => do not infer run-here"
         );
-        assert!(!should_run_here_in_own_herdr_pane(
-            "midi",
-            None,
-            Some("w24:p79")
-        ));
+        assert!(
+            !should_run_here_in_own_herdr_pane("midi", None, None),
+            "no herdr pane, even with no instance name"
+        );
     }
 
     #[test]
