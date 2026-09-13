@@ -2011,6 +2011,31 @@ fn substitute_herdr_create_argv(
         .collect()
 }
 
+/// `herdr tab rename <TAB_ID> <LABEL>` argv for a run-here resume.
+/// `None` if we should not rename (missing tab id or empty label).
+fn herdr_run_here_tab_rename_argv(
+    tab_id: Option<&str>,
+    label: Option<&str>,
+) -> Option<Vec<String>> {
+    let tab_id = tab_id.filter(|s| !s.is_empty())?;
+    let label = label.filter(|s| !s.is_empty())?;
+    Some(vec![
+        "herdr".into(),
+        "tab".into(),
+        "rename".into(),
+        tab_id.into(),
+        label.into(),
+    ])
+}
+
+fn rename_calling_herdr_tab(instance_name: Option<&str>) {
+    let tab_id = std::env::var("HERDR_TAB_ID").ok();
+    let Some(argv) = herdr_run_here_tab_rename_argv(tab_id.as_deref(), instance_name) else {
+        return;
+    };
+    let _ = Command::new(&argv[0]).args(&argv[1..]).status();
+}
+
 /// Launch terminal with command.
 ///
 /// # Modes
@@ -2144,6 +2169,10 @@ pub fn launch_terminal(
 
     // Run in current terminal (blocking)
     if run_here {
+        // New-window herdr path labels the tab at `tab create --label`.
+        // --run-here skips create, so rename the calling tab to the instance
+        // name before exec. Best-effort: a failed rename must not block resume.
+        rename_calling_herdr_tab(final_env.get("HCOM_INSTANCE_NAME").map(String::as_str));
         // Build full env (config + shell)
         let full_env = build_full_env(&final_env);
         if let Some(dir) = cwd {
@@ -4068,5 +4097,26 @@ mod tests {
         assert!(!terminal_preset_supported_on("wttab", "Darwin"));
         assert!(terminal_preset_supported_on("wezterm", "Windows"));
         assert!(!terminal_preset_supported_on("nope", "Darwin"));
+    }
+
+    #[test]
+    fn herdr_run_here_tab_rename_argv_positional() {
+        assert_eq!(
+            herdr_run_here_tab_rename_argv(Some("w20:t1"), Some("dani")),
+            Some(vec![
+                "herdr".into(),
+                "tab".into(),
+                "rename".into(),
+                "w20:t1".into(),
+                "dani".into(),
+            ])
+        );
+        assert_eq!(herdr_run_here_tab_rename_argv(None, Some("dani")), None);
+        assert_eq!(herdr_run_here_tab_rename_argv(Some("w20:t1"), None), None);
+        assert_eq!(herdr_run_here_tab_rename_argv(Some(""), Some("dani")), None);
+        assert_eq!(
+            herdr_run_here_tab_rename_argv(Some("w20:t1"), Some("")),
+            None
+        );
     }
 }
