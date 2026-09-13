@@ -456,7 +456,110 @@ fn start_handler_uses_central_binding_for_existing_session() {
     let rebound = db.get_instance_full("miso").unwrap().unwrap();
     assert_eq!(rebound.last_event_id, 42);
     assert_eq!(rebound.directory, temp.path().to_string_lossy());
+    assert_eq!(
+        db.get_session_binding("sid-123").unwrap().as_deref(),
+        Some("miso"),
+        "handle_start must move session_bindings, not only instances.session_id"
+    );
 
+    cleanup(path);
+}
+
+#[test]
+fn start_handler_rebinds_new_session_on_placeholder_process() {
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+    save_test_instance(&db, "tori", ST_LISTENING);
+    db.set_process_binding("pid-child", "", "tori").unwrap();
+
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "pid-child".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &[
+            "--session-id".to_string(),
+            "01a0756e-131e-7000-ae7d-d9fdd467544d".to_string(),
+            "--cwd".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(code, 0, "{output}");
+    assert_eq!(
+        db.get_session_binding("01a0756e-131e-7000-ae7d-d9fdd467544d")
+            .unwrap()
+            .as_deref(),
+        Some("tori")
+    );
+    cleanup(path);
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[test]
+fn start_handler_refuses_inherited_name_when_live_pid_holds_other_session() {
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+    let live_sid = "01a0756e-131e-7000-ae7d-d9fdd467544d";
+    let incoming = "01a09653-64eb-7000-b597-68ce60a04f5c";
+    let jsonl = temp
+        .path()
+        .join(format!("2026-09-06T06-35-43-262Z_{live_sid}.jsonl"));
+    std::fs::write(&jsonl, "{}").unwrap();
+    let _hold = std::fs::File::open(&jsonl).unwrap();
+
+    let mut row = serde_json::Map::new();
+    row.insert("name".into(), serde_json::json!("tori"));
+    row.insert("tool".into(), serde_json::json!("omp"));
+    row.insert("status".into(), serde_json::json!(ST_LISTENING));
+    row.insert("status_context".into(), serde_json::json!(""));
+    row.insert("status_detail".into(), serde_json::json!(""));
+    row.insert("session_id".into(), serde_json::json!(live_sid));
+    row.insert("pid".into(), serde_json::json!(std::process::id() as i64));
+    row.insert("created_at".into(), serde_json::json!(1.0));
+    db.save_instance_named("tori", &row).unwrap();
+    db.rebind_session(live_sid, "tori").unwrap();
+    db.set_process_binding("pid-child", "", "tori").unwrap();
+
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "pid-child".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &[
+            "--session-id".to_string(),
+            incoming.to_string(),
+            "--cwd".to_string(),
+            "/tmp/wireprobe".to_string(),
+        ],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        output.contains("error"),
+        "inherited-name child must not bind; got {output}"
+    );
+    assert!(
+        output.contains("refusing") || output.contains("No instance bound"),
+        "expected refuse or unbound, got {output}"
+    );
+    assert_eq!(
+        db.get_session_binding(live_sid).unwrap().as_deref(),
+        Some("tori")
+    );
+    assert_eq!(db.get_session_binding(incoming).unwrap(), None);
+    let inst = db.get_instance_full("tori").unwrap().unwrap();
+    assert_ne!(
+        inst.directory.as_str(),
+        "/tmp/wireprobe",
+        "live owner cwd must not become the child's cwd"
+    );
     cleanup(path);
 }
 

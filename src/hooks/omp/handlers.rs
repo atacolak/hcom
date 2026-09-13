@@ -133,6 +133,39 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
             },
         };
 
+    // A child that inherited HCOM_INSTANCE_NAME / HCOM_PROCESS_ID from a live
+    // owner must not overwrite that owner's session/cwd. If the instance's OS
+    // pid is alive and holds a different jsonl, this start is a different
+    // process stealing the name.
+    if let Ok(Some(inst)) = db.get_instance_full(&instance_name) {
+        if let Some(pid) = inst.pid {
+            let pid = pid as u32;
+            if crate::pidtrack::is_alive(pid) {
+                let live = crate::pidtrack::live_open_session_ids(pid);
+                if !live.is_empty() && !live.iter().any(|sid| sid == &session_id) {
+                    log_error(
+                        "hooks",
+                        "omp-start.live_session_mismatch",
+                        &format!(
+                            "instance={instance_name} pid={pid} live={} incoming={session_id}",
+                            live.join(",")
+                        ),
+                    );
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!(
+                                "instance '{instance_name}' is live in pid {pid} holding session {}; refusing to bind {session_id}",
+                                live.join(",")
+                            )
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     initialize_last_event_id(db, &instance_name);
     lifecycle::set_status(
         db,
@@ -157,6 +190,13 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         updates.insert("directory".into(), serde_json::json!(cwd));
     }
     instances::update_instance_position(db, &instance_name, &updates);
+    if let Err(e) = db.rebind_session(&session_id, &instance_name) {
+        log_error(
+            "hooks",
+            "omp-start.rebind_session",
+            &format!("instance={instance_name} session_id={session_id} err={e}"),
+        );
+    }
     if let Some(port) = notify_port {
         upsert_plugin_notify_endpoint(db, &instance_name, port);
     }
@@ -634,7 +674,13 @@ mod tests {
         let (_, out) = handle_read(
             &db,
             &argv(&[
-                "--name", "bob", "--ack", "--ids", &a.to_string(), "--up-to", "1",
+                "--name",
+                "bob",
+                "--ack",
+                "--ids",
+                &a.to_string(),
+                "--up-to",
+                "1",
             ]),
         );
         let v: Value = serde_json::from_str(&out).unwrap();

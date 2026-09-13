@@ -252,6 +252,23 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
         .map(|suffix| suffix.to_string())
 }
 
+/// True when `name`'s OS pid is alive and holds a jsonl whose session id is
+/// not `incoming_session`. Unobservable /proc does not trip this.
+fn live_instance_holds_other_session(db: &HcomDb, name: &str, incoming_session: &str) -> bool {
+    let Ok(Some(inst)) = db.get_instance_full(name) else {
+        return false;
+    };
+    let Some(pid) = inst.pid else {
+        return false;
+    };
+    let pid = pid as u32;
+    if !crate::pidtrack::is_alive(pid) {
+        return false;
+    }
+    let live = crate::pidtrack::live_open_session_ids(pid);
+    !live.is_empty() && !live.iter().any(|sid| sid == incoming_session)
+}
+
 fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
     let Some(data) = data else {
         return false;
@@ -592,40 +609,51 @@ pub fn bind_session_to_process(
         return Some(stopped_name);
     }
 
-    // Path 3: No canonical, but placeholder exists — bind session to placeholder
-    if let Some(ref ph_name) = placeholder_name {
-        crate::log::log_info(
-            "binding",
-            "bind_session_to_process.bind_placeholder",
-            &format!("placeholder={}, session_id={}", ph_name, session_id),
-        );
-
-        if let Err(e) = db.clear_session_id_from_other_instances(session_id, ph_name) {
-            crate::log::log_error("binding", "bind_placeholder.clear_session", &format!("{e}"));
-        }
-
-        let mut updates = serde_json::Map::new();
-        updates.insert("session_id".into(), serde_json::json!(session_id));
-        update_instance_position(db, ph_name, &updates);
-
-        if let Err(e) = db.rebind_session(session_id, ph_name) {
-            crate::log::log_error(
-                "binding",
-                "bind_placeholder.rebind_session",
-                &format!("{e}"),
-            );
-        }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
+    // Path 3: No canonical, but placeholder exists — bind session to placeholder.
+    // A live owner (not a true launch placeholder) whose OS pid holds a
+    // different jsonl must not be overwritten by an inherited-HCOM_NAME child.
+    if let Some(ph_name) = &placeholder_name {
+        if !is_true_launch_placeholder(placeholder_data.as_ref())
+            && live_instance_holds_other_session(db, ph_name, session_id)
         {
             crate::log::log_error(
                 "binding",
-                "bind_placeholder.set_process_binding",
-                &format!("{e}"),
+                "bind_placeholder.live_session_mismatch",
+                &format!("placeholder={ph_name} incoming={session_id}; refusing overwrite"),
             );
-        }
+        } else {
+            crate::log::log_info(
+                "binding",
+                "bind_session_to_process.bind_placeholder",
+                &format!("placeholder={}, session_id={}", ph_name, session_id),
+            );
 
-        return Some(ph_name.clone());
+            if let Err(e) = db.clear_session_id_from_other_instances(session_id, ph_name) {
+                crate::log::log_error("binding", "bind_placeholder.clear_session", &format!("{e}"));
+            }
+
+            let mut updates = serde_json::Map::new();
+            updates.insert("session_id".into(), serde_json::json!(session_id));
+            update_instance_position(db, ph_name, &updates);
+
+            if let Err(e) = db.rebind_session(session_id, ph_name) {
+                crate::log::log_error(
+                    "binding",
+                    "bind_placeholder.rebind_session",
+                    &format!("{e}"),
+                );
+            }
+            if let Some(pid) = process_id
+                && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
+            {
+                crate::log::log_error(
+                    "binding",
+                    "bind_placeholder.set_process_binding",
+                    &format!("{e}"),
+                );
+            }
+            return Some(ph_name.clone());
+        }
     }
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");

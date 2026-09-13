@@ -503,7 +503,7 @@ fn live_cwd(_pid: u32) -> Option<String> {
 /// Session ids of jsonl transcripts the pid *or any descendant* holds open.
 /// Empty means unobservable, not "no session".
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn live_open_session_ids(root: u32) -> Vec<String> {
+pub(crate) fn live_open_session_ids(root: u32) -> Vec<String> {
     let mut ids = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
     for pid in pid_tree(root) {
@@ -526,7 +526,7 @@ fn live_open_session_ids(root: u32) -> Vec<String> {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-fn live_open_session_ids(_root: u32) -> Vec<String> {
+pub(crate) fn live_open_session_ids(_root: u32) -> Vec<String> {
     Vec::new()
 }
 
