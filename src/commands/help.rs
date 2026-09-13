@@ -957,17 +957,19 @@ Commands:\n\
 /// Flags accepted by both `hcom <tool>` (fresh launch) and `hcom r` / `hcom f`
 /// (resume/fork). Indented to 4 spaces for tool help, re-indented for resume.
 ///
-/// NOTE: `--run-here` / `--no-run-here` are intentionally omitted from help.
-/// They still work — they're parsed in launch.rs and resume.rs — but they're
-/// an internal detail (TUI injects `--no-run-here`) and a power-user escape
-/// hatch (unsupported terminal emulators), not something to advertise.
+/// `--run-here` is the in-pane resume/launch path: worlds actor recycle and
+/// any caller that must not mint a new herdr tab pass it. `--no-run-here` stays
+/// unlisted; the TUI injects it so a dashboard launch cannot steal the TUI
+/// pane. `--terminal here` is the same force-current-terminal switch when
+/// `--run-here` is unset (`will_run_in_current_terminal`).
 const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
-    ("--terminal <preset>", "Where new windows open"),
+    ("--terminal <preset>", "Where new windows open (`here` = this pane)"),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
+    ("--run-here", "Resume/launch in this pane (do not mint a new tab)"),
 ];
 
 /// Shared help body for `hcom r` / `hcom f` (both accept the same target
@@ -1275,6 +1277,15 @@ mod tests {
 
         let resume_help = get_command_help("r");
         assert!(resume_help.contains("Claude/Kimi resume or fork only"));
+        assert!(
+            resume_help.contains("--run-here"),
+            "hcom r --help must list --run-here; hiding it makes in-pane resume undiscoverable"
+        );
+        let omp_help = get_command_help("omp");
+        assert!(
+            omp_help.contains("--run-here"),
+            "hcom omp --help must list --run-here"
+        );
     }
 
     #[test]
