@@ -268,8 +268,10 @@ fn start_from_orphan(
         instance_names::generate_unique_name(db)?
     };
 
-    // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    // Core DB registration. Leave the pidtrack entry in place on failure so
+    // recovery can be retried (including a live-identity mismatch refuse).
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name)
+        .map_err(|e| anyhow::anyhow!("orphan recover refused: {e}"))?;
 
     db.log_event(
         "life",

@@ -322,6 +322,10 @@ pub fn recover_single_orphan_to_db(
     use crate::instances;
     use crate::shared::constants::ST_LISTENING;
 
+    if let Some(reason) = live_identity_conflicts(orphan) {
+        return Err(reason);
+    }
+
     let now = crate::shared::time::now_epoch_i64();
 
     // Create instance row — this is the critical step; fail = abort recovery
@@ -416,6 +420,136 @@ pub fn recover_single_orphan_to_db(
     );
 
     Ok(())
+}
+
+/// Session id encoded in an open transcript path, if any.
+///
+/// OMP/Pi: `.../2026-09-09T10-16-43-723Z_<session-id>.jsonl`
+/// Claude-style: `.../<session-id>.jsonl` where the stem is the id.
+fn session_id_from_open_path(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let stem = name.strip_suffix(".jsonl")?;
+    if let Some((_, sid)) = stem.rsplit_once('_') {
+        if !sid.is_empty() {
+            return Some(sid.to_string());
+        }
+    }
+    if !stem.is_empty() {
+        return Some(stem.to_string());
+    }
+    None
+}
+
+/// Whether the stored pidtrack identity disagrees with what the live process
+/// actually holds. `None` = no authoritative conflict (including "could not
+/// observe" — refuse only when the mismatch is visible).
+fn identity_conflicts(
+    stored_session: &str,
+    stored_directory: &str,
+    live_sessions: &[String],
+    live_cwd: Option<&str>,
+) -> Option<String> {
+    if !stored_session.is_empty()
+        && !live_sessions.is_empty()
+        && !live_sessions.iter().any(|sid| sid == stored_session)
+    {
+        return Some(format!(
+            "orphan pid holds session {} but pidtrack stored {}; refusing to stamp the stored identity",
+            live_sessions.join(","),
+            stored_session
+        ));
+    }
+    if let Some(live) = live_cwd {
+        if !stored_directory.is_empty() && !live.is_empty() {
+            let stored_path = std::path::Path::new(stored_directory);
+            let live_path = std::path::Path::new(live);
+            let same = match (stored_path.canonicalize(), live_path.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => stored_path == live_path,
+            };
+            if !same {
+                return Some(format!(
+                    "orphan pid cwd is {live} but pidtrack stored {stored_directory}; refusing to stamp the stored identity"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn live_identity_conflicts(orphan: &OrphanProcess) -> Option<String> {
+    let live_sessions = live_open_session_ids(orphan.pid);
+    let live_cwd = live_cwd(orphan.pid);
+    identity_conflicts(
+        &orphan.session_id,
+        &orphan.directory,
+        &live_sessions,
+        live_cwd.as_deref(),
+    )
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn live_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn live_cwd(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Session ids of jsonl transcripts the pid *or any descendant* holds open.
+/// Empty means unobservable, not "no session".
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn live_open_session_ids(root: u32) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for pid in pid_tree(root) {
+        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let path = target.to_string_lossy();
+            if let Some(sid) = session_id_from_open_path(&path) {
+                if seen_ids.insert(sid.clone()) {
+                    ids.push(sid);
+                }
+            }
+        }
+    }
+    ids
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn live_open_session_ids(_root: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn pid_tree(root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        out.push(pid);
+        let children_path = format!("/proc/{pid}/task/{pid}/children");
+        if let Ok(text) = std::fs::read_to_string(children_path) {
+            for child in text.split_whitespace() {
+                if let Ok(c) = child.parse::<u32>() {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -599,7 +733,7 @@ mod tests {
             pid: std::process::id(),
             tool: "claude".into(),
             names: vec!["luna".into()],
-            directory: "/tmp".into(),
+            directory: String::new(),
             process_id: "pid-1".into(),
             terminal_preset: String::new(),
             pane_id: String::new(),
@@ -616,6 +750,58 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error when DB has no instances table"
+        );
+    }
+
+    #[test]
+    fn test_session_id_from_omp_and_claude_paths() {
+        assert_eq!(
+            session_id_from_open_path(
+                "/home/sf/.omp/agent/sessions/-workspace-voicecat/2026-09-06T06-35-43-262Z_01a0756e-131e-7000-ae7d-d9fdd467544d.jsonl"
+            )
+            .as_deref(),
+            Some("01a0756e-131e-7000-ae7d-d9fdd467544d")
+        );
+        assert_eq!(
+            session_id_from_open_path("/home/sf/.claude/projects/p/abc-uuid.jsonl").as_deref(),
+            Some("abc-uuid")
+        );
+        assert_eq!(session_id_from_open_path("/tmp/not-a-transcript.txt"), None);
+    }
+
+    #[test]
+    fn test_identity_conflicts_refuses_stored_session_when_live_holds_another() {
+        let reason = identity_conflicts(
+            "01a09653-64eb-7000-b597-68ce60a04f5c",
+            "/tmp/wireprobe",
+            &["01a0756e-131e-7000-ae7d-d9fdd467544d".into()],
+            Some("/home/sf/workspace/voicecat"),
+        )
+        .expect("tori-shaped mismatch must refuse");
+        assert!(reason.contains("01a0756e-131e-7000-ae7d-d9fdd467544d"));
+        assert!(reason.contains("01a09653-64eb-7000-b597-68ce60a04f5c"));
+        assert!(reason.contains("refusing"));
+    }
+
+    #[test]
+    fn test_identity_conflicts_silent_when_live_unobservable() {
+        assert_eq!(
+            identity_conflicts("01a09653-stub", "/tmp/wireprobe", &[], None),
+            None,
+            "no /proc observation must not refuse — that is not an authoritative miss"
+        );
+    }
+
+    #[test]
+    fn test_identity_conflicts_allows_matching_live_session() {
+        assert_eq!(
+            identity_conflicts(
+                "01a0756e-131e-7000-ae7d-d9fdd467544d",
+                "/home/sf/workspace/voicecat",
+                &["01a0756e-131e-7000-ae7d-d9fdd467544d".into()],
+                Some("/home/sf/workspace/voicecat"),
+            ),
+            None
         );
     }
 }
