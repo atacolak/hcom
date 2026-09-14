@@ -401,6 +401,57 @@ fn status_handler_wakes_plugin_only_when_entering_listening() {
 }
 
 #[test]
+fn start_handler_returns_participant_primer_alongside_the_cli_catalog() {
+    // `omp-start` hands the plugin both texts; the plugin picks at inject time
+    // (participant when the actor bridge is mounted, full catalog otherwise).
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    db.set_process_binding("pid-omp", "", "luna").unwrap();
+
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "pid-omp".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &[
+            "--session-id".to_string(),
+            "sid-participant".to_string(),
+            "--cwd".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(code, 0, "{output}");
+
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let full = response
+        .get("bootstrap")
+        .and_then(|v| v.as_str())
+        .expect("full bootstrap string");
+    let participant = response
+        .get("bootstrap_participant")
+        .and_then(|v| v.as_str())
+        .expect("participant bootstrap string");
+
+    assert!(full.contains("You MUST use"));
+    assert!(full.contains("Your name: luna"));
+    assert!(participant.contains("<hcom_system_context>"));
+    assert!(participant.contains("Your name: luna"));
+    assert!(participant.contains("send_to_actor"));
+    assert!(
+        !participant.contains("You MUST use"),
+        "the participant primer must not carry the CLI send contract"
+    );
+
+    cleanup(path);
+}
+
+#[test]
 fn start_handler_uses_central_binding_for_existing_session() {
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();

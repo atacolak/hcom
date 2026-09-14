@@ -175,7 +175,29 @@ function ackRejection(stdout: string): string | null {
 /** Test seam: the plugin's only external dependency. */
 export type HcomDeps = {
 	runHcom?: (args: string[]) => Promise<HcomResult>;
+	/** Test-only override for actor-tool detection; see `hasSendToActor`. */
+	hasSendToActor?: boolean;
 };
+
+/**
+ * Whether this process has the actor bridge (`send_to_actor`) in the
+ * model-visible tool surface, and must therefore get the participant primer
+ * instead of the CLI catalog. Unknown reads as `false`: fail closed toward the
+ * full catalog, never toward stripping the primer.
+ */
+function hasSendToActor(pi: ExtensionAPI, ctx: ExtensionContext, deps: HcomDeps): boolean {
+	if (typeof deps.hasSendToActor === "boolean") return deps.hasSendToActor;
+	// Not on the public `ExtensionAPI`; a runtime may still expose the loader's
+	// tool map. Unchecked cast, named: it is only a fast path — the prompt scan
+	// below is the authority, and a wrong read falls through to it.
+	const loaderTools = pi as { tools?: { has?: (name: string) => boolean } };
+	if (loaderTools.tools?.has?.("send_to_actor") === true) return true;
+	// A runtime without `getSystemPrompt` (a fake ctx, an older SDK) reads as no
+	// actor tools, which keeps the full catalog.
+	const prompt: unknown = ctx.getSystemPrompt?.();
+	const text = Array.isArray(prompt) ? prompt.join("\n") : typeof prompt === "string" ? prompt : "";
+	return /\bsend_to_actor\b/.test(text);
+}
 
 // Same-process latch: OMP task subagents load a fresh extension instance in the
 // parent Node process (SessionShutdownEvent has no sessionId). The first binder
@@ -216,6 +238,7 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 	let ownsIdentity = false;
 	let nestedOptOut = false;
 	let bootstrapText: string | null = null;
+	let bootstrapParticipantText: string | null = null;
 	let bindingPromise: Promise<void> | null = null;
 	let notifyServer: Server | null = null;
 	let notifyPort: number | null = null;
@@ -372,11 +395,14 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 				reg.owner = instanceName;
 				syncIdentityOwnerEnv(instanceName ?? "1");
 				bootstrapText = typeof json.bootstrap === "string" ? json.bootstrap : null;
+				bootstrapParticipantText =
+					typeof json.bootstrap_participant === "string" ? json.bootstrap_participant : null;
 				startReconcileTimer();
 				log("INFO", "plugin.bound", instanceName, {
 					session_id: sessionId,
 					notify_port: port,
 					bootstrap_len: bootstrapText?.length ?? 0,
+					participant_len: bootstrapParticipantText?.length ?? 0,
 				});
 			} catch (error) {
 				stopNotifyServer();
@@ -619,6 +645,7 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		instanceName = null;
 		sessionId = null;
 		bootstrapText = null;
+		bootstrapParticipantText = null;
 		bindingPromise = null;
 		pendingAck = null;
 		ackInFlight = null;
@@ -765,11 +792,19 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
 		bootstrapInjectedForSession = sid;
-		log("DEBUG", "plugin.hidden_bootstrap", instanceName, { bootstrap_len: bootstrapText.length });
+		// An actor-bridge process gets the participant primer; every other
+		// runtime keeps the full CLI catalog. A binary too old to send
+		// `bootstrap_participant` (or an empty one) always fails closed to full.
+		const participant = hasSendToActor(pi, ctx, deps) && bootstrapParticipantText ? bootstrapParticipantText : null;
+		const text = participant ?? bootstrapText;
+		log("DEBUG", "plugin.hidden_bootstrap", instanceName, {
+			bootstrap_len: text.length,
+			shape: participant ? "participant" : "full",
+		});
 		return {
 			message: {
 				customType: "hcom-bootstrap",
-				content: bootstrapText,
+				content: text,
 				display: false,
 			},
 		};

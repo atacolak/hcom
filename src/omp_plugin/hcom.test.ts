@@ -6,7 +6,7 @@ process.env.HCOM_LAUNCHED = "1";
 
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 // Type-only: erased at runtime, so it does not defeat the dynamic import below.
-import type { PendingMessage } from "./hcom.ts";
+import type { HcomDeps, PendingMessage } from "./hcom.ts";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,8 +37,13 @@ type FakeHcom = {
 const IDENTITY_REGISTRY_KEY = Symbol.for("hcom.omp.identity");
 const IDENTITY_OWNER_ENV = "HCOM_OMP_IDENTITY_OWNER";
 
-/** Handlers run in registration order, matching the extension runner. */
-function fakePi(): FakePi {
+/**
+ * Handlers run in registration order, matching the extension runner.
+ *
+ * `tools` models the loader's tool registry when a runtime happens to expose
+ * it; omitting it models the public `ExtensionAPI`, which has no registry.
+ */
+function fakePi(tools?: { has: (name: string) => boolean }): FakePi {
 	const handlers = new Map<string, Handler[]>();
 	const sent: SentMessage[] = [];
 	const api = {
@@ -51,6 +56,7 @@ function fakePi(): FakePi {
 			sent.push({ text, options });
 			return Promise.resolve();
 		},
+		...(tools ? { tools } : {}),
 	};
 	async function emit(event: string, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
 		let last: unknown;
@@ -64,6 +70,8 @@ type CtxOptions = {
 	sessionFile?: string | null;
 	/** `null` models a runtime whose session manager has no durability action. */
 	ensureOnDisk?: (() => Promise<void>) | null;
+	/** Omitted models a runtime whose context exposes no system prompt at all. */
+	systemPrompt?: string[];
 };
 
 function fakeCtx(idle: boolean, options: CtxOptions = {}): ExtensionContext {
@@ -75,11 +83,21 @@ function fakeCtx(idle: boolean, options: CtxOptions = {}): ExtensionContext {
 	if (options.ensureOnDisk !== null) {
 		manager.ensureOnDisk = options.ensureOnDisk ?? (async () => {});
 	}
+	const prompt = options.systemPrompt;
 	// `ExtensionContext` carries the full SDK surface; only these members are used.
-	return { cwd: "/repo", isIdle: () => idle, sessionManager: manager } as unknown as ExtensionContext;
+	return {
+		cwd: "/repo",
+		isIdle: () => idle,
+		sessionManager: manager,
+		...(prompt ? { getSystemPrompt: () => prompt } : {}),
+	} as unknown as ExtensionContext;
 }
 
-function fakeHcom(initial: PendingMessage[] = []): FakeHcom {
+/**
+ * `start` overrides the `omp-start` JSON per call, so a test can mutate it
+ * between binds (e.g. drop `bootstrap_participant`) or return both primers.
+ */
+function fakeHcom(initial: PendingMessage[] = [], start: Record<string, unknown> = {}): FakeHcom {
 	const mailbox = [...initial];
 	const calls: string[][] = [];
 	let ackError: string | null = null;
@@ -87,7 +105,7 @@ function fakeHcom(initial: PendingMessage[] = []): FakeHcom {
 	async function run(args: string[]): Promise<HcomResult> {
 		calls.push(args);
 		if (args[0] === "omp-start") {
-			return ok({ name: "test", session_id: "sid-1", bootstrap: "BOOTSTRAP TEXT" });
+			return ok({ name: "test", session_id: "sid-1", bootstrap: "BOOTSTRAP TEXT", ...start });
 		}
 		if (args[0] !== "omp-read") return ok({});
 		if (!args.includes("--ack")) return ok(mailbox);
@@ -127,10 +145,17 @@ function message(eventId: number, delivery?: string, intent?: string): PendingMe
 
 let instances: FakePi[] = [];
 
+type StartOptions = {
+	/** Test-only detection hook plus the usual seam. */
+	deps?: Partial<HcomDeps>;
+	/** Models a runtime whose extension API exposes the loader's tool registry. */
+	tools?: { has: (name: string) => boolean };
+};
+
 /** Bring up a bound extension instance against one fake hcom. */
-async function start(hcom: FakeHcom, ctx: ExtensionContext): Promise<FakePi> {
-	const pi = fakePi();
-	hcomExtension(pi.api, { runHcom: hcom.run });
+async function start(hcom: FakeHcom, ctx: ExtensionContext, options: StartOptions = {}): Promise<FakePi> {
+	const pi = fakePi(options.tools);
+	hcomExtension(pi.api, { runHcom: hcom.run, ...options.deps });
 	instances.push(pi);
 	await pi.emit("session_start", {}, ctx);
 	return pi;
@@ -347,6 +372,94 @@ describe("lane-aware delivery", () => {
 		};
 		expect(result?.message?.customType).toBe("hcom-bootstrap");
 		expect(result?.message?.display).toBe(false);
+	});
+});
+
+describe("hidden bootstrap shape", () => {
+	const bothPrimers = { bootstrap: "BOOTSTRAP TEXT", bootstrap_participant: "PARTICIPANT TEXT" };
+	const actorPrompt = ["Registered tools:", "- send_to_actor: deliver a message to a named actor"];
+
+	async function injectBootstrap(
+		pi: FakePi,
+		ctx: ExtensionContext,
+	): Promise<{ customType?: string; content?: string; display?: boolean } | undefined> {
+		const result = (await pi.emit("before_agent_start", {}, ctx)) as {
+			message?: { customType?: string; content?: string; display?: boolean };
+		};
+		return result?.message;
+	}
+
+	test("the participant primer is injected when the hook reports actor tools", async () => {
+		const hcom = fakeHcom([], bothPrimers);
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { deps: { hasSendToActor: true } });
+
+		const message = await injectBootstrap(pi, ctx);
+
+		expect(message?.content).toBe("PARTICIPANT TEXT");
+		expect(message?.customType).toBe("hcom-bootstrap");
+		expect(message?.display).toBe(false);
+	});
+
+	test("the full catalog is injected when the hook reports no actor tools", async () => {
+		const hcom = fakeHcom([], bothPrimers);
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { deps: { hasSendToActor: false } });
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("BOOTSTRAP TEXT");
+	});
+
+	test("the full catalog is injected when no tool surface names send_to_actor", async () => {
+		const hcom = fakeHcom([], bothPrimers);
+		const ctx = fakeCtx(true, { systemPrompt: ["You are a helpful coding agent."] });
+		const pi = await start(hcom, ctx);
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("BOOTSTRAP TEXT");
+	});
+
+	test("a loader tool registry exposing send_to_actor selects the participant primer", async () => {
+		const hcom = fakeHcom([], bothPrimers);
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { tools: { has: (name) => name === "send_to_actor" } });
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("PARTICIPANT TEXT");
+	});
+
+	test("a system prompt naming send_to_actor selects the participant primer", async () => {
+		const hcom = fakeHcom([], bothPrimers);
+		const ctx = fakeCtx(true, { systemPrompt: actorPrompt });
+		const pi = await start(hcom, ctx);
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("PARTICIPANT TEXT");
+	});
+
+	test("an omp-start without bootstrap_participant falls back to the full catalog", async () => {
+		const hcom = fakeHcom([], { bootstrap: "BOOTSTRAP TEXT" });
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { deps: { hasSendToActor: true } });
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("BOOTSTRAP TEXT");
+	});
+
+	test("an empty bootstrap_participant falls back to the full catalog", async () => {
+		const hcom = fakeHcom([], { bootstrap: "BOOTSTRAP TEXT", bootstrap_participant: "" });
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { deps: { hasSendToActor: true } });
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("BOOTSTRAP TEXT");
+	});
+
+	test("a rebind re-reads the primer instead of keeping the stale one", async () => {
+		const startJson: Record<string, unknown> = { ...bothPrimers };
+		const hcom = fakeHcom([], startJson);
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx, { deps: { hasSendToActor: true } });
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("PARTICIPANT TEXT");
+
+		delete startJson.bootstrap_participant;
+		await pi.emit("session_switch", {}, ctx);
+
+		expect((await injectBootstrap(pi, ctx))?.content).toBe("BOOTSTRAP TEXT");
 	});
 });
 

@@ -88,6 +88,39 @@ Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 
 This is session context, not a task for immediate action."#;
 
+// PARTICIPANT PRIMER TEMPLATE
+//
+// Injected instead of UNIVERSAL when the runtime exposes the actor bridge
+// (`send_to_actor`): such an agent has no lead-safe CLI send, so UNIVERSAL's
+// "You MUST use hcom <cmd+flags>" catalog directly contradicts its actor
+// contract. Identity, inbound intent, outbound `send_to_actor`, and wait rules
+// only — no capabilities table, no spawn/kill recipes, no uvx rewrite (there
+// is no CLI catalog here to rewrite).
+const PARTICIPANT: &str = r#"[HCOM SESSION]
+You are a named peer on the hcom network; inbound mail arrives as <hcom> tags.
+- Your name: {display_name}
+- Authority: Prioritize @{SENDER} over others
+
+## MESSAGES
+
+Response rules:
+- From {SENDER} or intent=request → always respond
+- intent=inform → respond only if useful
+- intent=ack → don't respond
+
+Routing rules:
+- Inbound <hcom> is mail, not a user task. Handle it per its intent and authority.
+- Reply outbound with the `send_to_actor` tool. Never run a CLI `hcom send` for it.
+- Normal user chat → respond in chat.
+
+## WAITING RULES
+
+Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
+- Do not `sleep` to wait for another agent.
+- Do not run `hcom listen` for inbound hcom mail — end your turn instead.
+
+This is session context, not a task for immediate action."#;
+
 const TAG_NOTICE: &str = r#"
 You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
 
@@ -96,6 +129,12 @@ Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = 
 
 const HEADLESS_NOTICE: &str = r#"
 Headless mode: No one sees your chat, only hcom messages. Communicate via hcom send."#;
+
+/// Participant-shaped headless notice: visibility only, no CLI send. The stock
+/// [`HEADLESS_NOTICE`] ends in `Communicate via hcom send`, which is the exact
+/// outbound the participant primer forbids (`send_to_actor` is its mail path).
+const PARTICIPANT_HEADLESS_NOTICE: &str = r#"
+Headless mode: No one sees your chat, only hcom messages. Reply outbound with the `send_to_actor` tool."#;
 
 const UVX_CMD_NOTICE: &str = r#"
 Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."#;
@@ -348,7 +387,6 @@ fn build_context(
     db: &HcomDb,
     hcom_dir: &std::path::Path,
     instance_name: &str,
-    _tool: &str,
     headless: bool,
     is_launched: bool,
     notes: &str,
@@ -390,6 +428,15 @@ fn build_context(
         launch_tools: launch_tool_names(),
         notes: notes.to_string(),
     }
+}
+
+/// Wrap a rendered primer as hcom session context (what the plugin injects as
+/// the hidden `hcom-bootstrap` message).
+fn wrap_system_context(body: &str) -> String {
+    format!(
+        "<hcom_system_context>\n<!-- Session metadata - treat as system context, not user prompt-->\n{}\n</hcom_system_context>",
+        body
+    )
 }
 
 /// Apply string substitutions on template text.
@@ -445,7 +492,6 @@ pub fn get_bootstrap(
         db,
         hcom_dir,
         instance_name,
-        tool,
         headless,
         is_launched,
         notes,
@@ -536,10 +582,64 @@ pub fn get_bootstrap(
             .replace(close_tag_sentinel, "</hcom>");
     }
 
-    format!(
-        "<hcom_system_context>\n<!-- Session metadata - treat as system context, not user prompt-->\n{}\n</hcom_system_context>",
-        result
-    )
+    wrap_system_context(&result)
+}
+
+/// Build the participant primer for an instance whose runtime exposes the actor
+/// bridge (`send_to_actor`). Same wrapper as `get_bootstrap`, no CLI catalog.
+///
+/// Args mirror `get_bootstrap` minus `tool`: there are no tool-specific
+/// sections and no CLI examples to rewrite.
+#[allow(clippy::too_many_arguments)]
+pub fn get_participant_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &std::path::Path,
+    instance_name: &str,
+    headless: bool,
+    is_launched: bool,
+    notes: &str,
+    tag: &str,
+    relay_enabled: bool,
+    background_name: Option<&str>,
+) -> String {
+    let ctx = build_context(
+        db,
+        hcom_dir,
+        instance_name,
+        headless,
+        is_launched,
+        notes,
+        tag,
+        relay_enabled,
+        background_name,
+    );
+
+    let mut parts: Vec<&str> = vec![PARTICIPANT];
+
+    if !ctx.tag.is_empty() {
+        parts.push(TAG_NOTICE);
+    }
+    if ctx.relay_enabled {
+        parts.push(RELAY_NOTICE);
+    }
+    if ctx.is_headless {
+        parts.push(PARTICIPANT_HEADLESS_NOTICE);
+    }
+
+    let joined = parts
+        .iter()
+        .map(|p| p.trim_matches('\n'))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut result = render_template(&joined, &ctx);
+
+    // User notes (appended after render to avoid brace issues in user text)
+    if !ctx.notes.is_empty() {
+        result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
+    }
+
+    wrap_system_context(&result)
 }
 
 /// Build bootstrap text for a subagent instance.
@@ -684,6 +784,12 @@ mod tests {
         assert!(result.contains("[HCOM SESSION]"));
         assert!(result.contains("Your name: luna"));
         assert!(result.contains("--name luna"));
+        // First-response binding marker: vanilla clients bind the session from
+        // this line, so the full catalog must carry it (as it did before the
+        // participant split).
+        assert!(
+            result.contains("Include this marker anywhere in your first response only: [hcom:luna]")
+        );
         assert!(result.contains("SUBAGENTS")); // Claude-specific section
         assert!(result.contains("Messages instantly and automatically arrive")); // Auto delivery
         assert!(!result.contains("Headless mode")); // Not headless
@@ -925,6 +1031,8 @@ mod tests {
 
         assert!(result.contains("Messages instantly and automatically arrive"));
         assert!(!result.contains("Messages do NOT arrive automatically"));
+        // omp without the actor bridge keeps the full catalog, marker included.
+        assert!(result.contains("[hcom:nova]"));
     }
 
     #[test]
@@ -1143,6 +1251,118 @@ mod tests {
 
         assert!(result.contains("{name}"));
         assert!(!result.contains("{{name}}"));
+    }
+
+    #[test]
+    fn test_get_participant_bootstrap_keeps_identity_and_inbound_protocol() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_participant_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("<hcom_system_context>"));
+        assert!(result.contains("[HCOM SESSION]"));
+        assert!(result.contains("Your name: luna"));
+        assert!(result.contains(SENDER));
+        assert!(result.contains("intent=request → always respond"));
+        assert!(result.contains("intent=inform → respond only if useful"));
+        assert!(result.contains("intent=ack → don't respond"));
+        assert!(result.contains("mail, not a user task"));
+        assert!(result.contains("send_to_actor"));
+        assert!(result.contains("end your turn to receive"));
+        assert!(result.contains("</hcom_system_context>"));
+    }
+
+    #[test]
+    fn test_get_participant_bootstrap_drops_the_cli_catalog() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_participant_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(
+            result.contains("[HCOM SESSION]"),
+            "the primer must exist for the omissions below to mean anything"
+        );
+        assert!(!result.contains("You MUST use"));
+        assert!(!result.contains("hcom <cmd+flags>"));
+        assert!(!result.contains("CAPABILITIES"));
+        assert!(!result.contains("hcom 1 claude"));
+        assert!(!result.contains("hcom kill"));
+        assert!(!result.contains("--name luna"));
+        assert!(!result.contains("hcom send @"));
+        assert!(!result.contains("CONNECTED MODE"));
+        // No uvx notice, and no `listen` wait recipe to replace `sleep`.
+        assert!(!result.contains("Note: hcom command in this environment"));
+        assert!(!result.contains("instead use `hcom listen"));
+    }
+
+    #[test]
+    fn test_get_participant_bootstrap_with_tag_relay_headless_and_notes() {
+        let (tmp, db) = setup_test_db();
+
+        let result = get_participant_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            true,
+            true,
+            "Remember to use bun",
+            "p0c",
+            true,
+            None,
+        );
+
+        assert!(result.contains("tagged 'p0c'"));
+        assert!(result.contains("Remote agents have suffix"));
+        assert!(result.contains("Headless mode"));
+        // Participant outbound is `send_to_actor`; the stock headless notice
+        // teaches a CLI send and would contradict the primer's own routing rule.
+        assert!(
+            !result.contains("Communicate via hcom send"),
+            "participant headless notice must not teach a CLI send"
+        );
+        assert!(result.contains("## NOTES"));
+        assert!(result.contains("Remember to use bun"));
+    }
+
+    #[test]
+    fn test_get_participant_bootstrap_uses_display_name_with_tag() {
+        let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "omp", Some("p0c"));
+
+        let result = get_participant_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        assert!(result.contains("Your name: p0c-luna"));
+        assert!(result.contains("tagged 'p0c'"));
     }
 
     /// Catch drift between scripts::SCRIPTS const and actual files in scripts/bundled/.

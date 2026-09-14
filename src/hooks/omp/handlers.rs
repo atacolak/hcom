@@ -68,7 +68,9 @@ fn instance_name_from_env(ctx: &HcomContext) -> Option<String> {
         .cloned()
 }
 
-fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
+/// Effective tag + relay state shared by the full catalog and the participant
+/// primer (instance tag overrides config tag).
+fn bootstrap_tag_and_relay(db: &HcomDb, instance_name: &str) -> (String, bool) {
     let tag = db
         .get_instance_full(instance_name)
         .ok()
@@ -78,10 +80,15 @@ fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String 
     let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
     let relay_enabled = crate::relay::is_relay_enabled(&hcom_config);
     let effective_tag = if tag.is_empty() {
-        &hcom_config.tag
+        hcom_config.tag.clone()
     } else {
-        &tag
+        tag
     };
+    (effective_tag, relay_enabled)
+}
+
+fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
+    let (tag, relay_enabled) = bootstrap_tag_and_relay(db, instance_name);
     bootstrap::get_bootstrap(
         db,
         &ctx.hcom_dir,
@@ -90,7 +97,25 @@ fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String 
         ctx.is_background,
         ctx.is_launched,
         &ctx.notes,
-        effective_tag,
+        &tag,
+        relay_enabled,
+        ctx.background_name.as_deref(),
+    )
+}
+
+/// Participant primer for an omp process whose model-visible tool surface
+/// includes the actor bridge (`send_to_actor`). The plugin chooses at inject
+/// time; rust only renders both shapes.
+fn participant_bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
+    let (tag, relay_enabled) = bootstrap_tag_and_relay(db, instance_name);
+    bootstrap::get_participant_bootstrap(
+        db,
+        &ctx.hcom_dir,
+        instance_name,
+        ctx.is_background,
+        ctx.is_launched,
+        &ctx.notes,
+        &tag,
         relay_enabled,
         ctx.background_name.as_deref(),
     )
@@ -207,10 +232,13 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
     );
     crate::relay::worker::ensure_worker(true);
 
+    let bootstrap = bootstrap_for(ctx, db, &instance_name);
+    let bootstrap_participant = participant_bootstrap_for(ctx, db, &instance_name);
     let response = serde_json::json!({
         "name": instance_name,
         "session_id": session_id,
-        "bootstrap": bootstrap_for(ctx, db, &instance_name),
+        "bootstrap": bootstrap,
+        "bootstrap_participant": bootstrap_participant,
     });
     (0, response.to_string())
 }
