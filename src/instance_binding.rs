@@ -4,6 +4,8 @@
 //! launch metadata capture, placeholder/canonical binding, and instance-row
 //! initialization for newly launched or recovered sessions.
 
+use rusqlite::OptionalExtension;
+
 use crate::db::{HcomDb, InstanceRow};
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
@@ -573,12 +575,26 @@ pub fn bind_session_to_process(
             "bind_session_to_process.restore_stopped",
             &format!("stopped_name={stopped_name}, session_id={session_id}"),
         );
-        recreate_instance_from_placeholder(
-            db,
-            &stopped_name,
-            session_id,
-            placeholder_data.as_ref(),
-        );
+        // Without a live placeholder row there is nothing to copy from —
+        // rebuild from the life.stopped snapshot so the returned name actually
+        // has a roster row. Fail closed: no row, no bind.
+        if placeholder_data.is_none() {
+            if !recreate_instance_from_stopped_snapshot(db, &stopped_name) {
+                crate::log::log_error(
+                    "binding",
+                    "restore_stopped.recreate_failed",
+                    &format!("stopped_name={stopped_name}, session_id={session_id}"),
+                );
+                return None;
+            }
+        } else {
+            recreate_instance_from_placeholder(
+                db,
+                &stopped_name,
+                session_id,
+                placeholder_data.as_ref(),
+            );
+        }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
@@ -713,6 +729,109 @@ pub fn recover_process_binding_for_instance(
         ),
     );
     Some(instance_name.to_string())
+}
+
+/// Self-heal: recreate a missing instances row from its latest life.stopped
+/// snapshot.
+///
+/// A live process's hooks can name an instance whose row was deleted out from
+/// under it (hard stop of a live process, DB reset). The life.stopped snapshot
+/// survives the delete and carries every field needed to rebuild the row
+/// (status inactive) so status/message events land on a real identity again.
+///
+/// Fail closed: no snapshot → false. If the snapshot's pid is still alive but
+/// its open session files contradict the snapshot session, the identity moved
+/// on → false (an empty live set means unobservable, not contradiction). The
+/// caller must not write events into the hole when this returns false.
+pub fn recreate_instance_from_stopped_snapshot(db: &HcomDb, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if db.get_instance_full(name).ok().flatten().is_some() {
+        return true;
+    }
+    let snapshot = db
+        .conn()
+        .query_row(
+            "SELECT json_extract(data, '$.snapshot') FROM events
+             WHERE type = 'life' AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+
+    let snap_pid = snapshot.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+    let snap_session = snapshot
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if snap_pid > 0 && crate::sys::process::is_alive(snap_pid as u32) {
+        let live = crate::pidtrack::live_open_session_ids(snap_pid as u32);
+        if !live.is_empty()
+            && !snap_session.is_empty()
+            && !live.iter().any(|s| s == snap_session)
+        {
+            crate::log::log_error(
+                "binding",
+                "recreate_stopped.live_session_mismatch",
+                &format!(
+                    "instance={name} pid={snap_pid} live={} snapshot={snap_session}",
+                    live.join(",")
+                ),
+            );
+            return false;
+        }
+    }
+
+    let field = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let created = initialize_instance_in_position_file(
+        db,
+        name,
+        field("session_id"),
+        field("parent_session_id"),
+        field("parent_name"),
+        field("agent_id"),
+        field("transcript_path"),
+        field("tool"),
+        snapshot
+            .get("background")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            != 0,
+        field("tag"),
+        None,
+        None,
+        field("hints"),
+        field("directory"),
+    );
+    // Keep the restored row killable/addressable when the original process is
+    // still alive (the live-fd guard above already vetted the session).
+    if created && snap_pid > 0 && crate::sys::process::is_alive(snap_pid as u32) {
+        if let Err(e) = db.update_instance_pid(name, snap_pid as u32) {
+            crate::log::log_error("binding", "recreate_stopped.restore_pid", &format!("{e}"));
+        }
+    }
+    if created {
+        crate::log::log_info(
+            "binding",
+            "recreate_stopped.restored",
+            &format!("instance={name}"),
+        );
+    }
+    created
 }
 
 /// Initialize the DB row and default bindings for an instance identity.

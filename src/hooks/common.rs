@@ -1407,6 +1407,38 @@ fn stop_instance_inner(
         }
     }
 
+    // Recycle-shaped hard stop of a still-running omp process (`hcom stop` on
+    // a live omp identity): keep the roster row. The process is alive and
+    // keeps emitting hooks; deleting the row strands the name ("identity not
+    // found"). Degrade to the proven soft-stop: mark inactive, keep the row,
+    // session_id, and the process binding; the life.stopped snapshot still
+    // gets logged for reclaim/self-heal. Headless stops killed the process
+    // above and still delete; placeholder stops are unchanged. `hcom kill`
+    // (reason `killed`) also still deletes: it SIGTERMed the process and wants
+    // the row gone even if the pid has not reported death yet.
+    let live_omp_pid = !placeholder
+        && !is_headless
+        && instance_data.tool == "omp"
+        && reason != "killed"
+        && pid.is_some_and(|p| crate::sys::process::is_alive(p as u32));
+    if live_omp_pid {
+        soft_finalize_session(db, instance_name, reason, None, true);
+        // soft_finalize stamps `inactive` + `exit:<reason>`, and
+        // `deliverable_instances` excludes exactly that pair — correct for a
+        // real turn end, wrong here: this process is alive and still emitting
+        // hooks, so `hcom send @name` must keep resolving. Re-stamp the kept
+        // row inactive-without-exit (the same shape addressable non-session
+        // rows use) while the life.stopped snapshot above stays intact.
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("stop:{}", reason),
+            Default::default(),
+        );
+        return StopOutcome::Stopped;
+    }
+
     // Capture wake ports BEFORE cleanup deletes them; we'll fire wakes after
     // delete so any remaining listeners see the row is gone.
     let wake_ports = crate::notify::snapshot_wake_ports(db, instance_name);
@@ -2843,6 +2875,135 @@ mod tests {
         assert_eq!(
             db.get_status("luna").unwrap().map(|(s, _)| s),
             Some(ST_INACTIVE.to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn stop_instance_live_omp_pid_keeps_roster_row() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id, pid, background)
+                 VALUES ('midi', 'listening', ?1, 'omp', 'sess-live', ?2, 0)",
+                rusqlite::params![now, std::process::id() as i64],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-live', 'sess-live', 'midi', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "midi", "test", "recycle");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        let row = db
+            .get_instance_full("midi")
+            .unwrap()
+            .expect("stop of a live omp process must keep the roster row");
+        assert_eq!(row.status, ST_INACTIVE);
+        assert_eq!(row.session_id.as_deref(), Some("sess-live"));
+        assert_eq!(
+            db.get_process_binding("pid-live").unwrap(),
+            Some("midi".to_string()),
+            "keep_process_binding semantics, same as omp --soft"
+        );
+        assert_eq!(
+            db.find_stopped_instance_by_session_id("sess-live")
+                .unwrap()
+                .as_deref(),
+            Some("midi"),
+            "life.stopped snapshot must exist for reclaim/self-heal"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn stop_instance_live_omp_pid_stays_send_addressable() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id, pid, background)
+                 VALUES ('midi', 'listening', ?1, 'omp', 'sess-addressable', ?2, 0)",
+                rusqlite::params![now, std::process::id() as i64],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "midi", "test", "external");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full("midi").unwrap().is_some(),
+            "keep-row branch must have kept the row"
+        );
+
+        // The process is still alive and keeps emitting hooks, so the kept row
+        // must stay deliverable: `send @name` refuses session-stopped rows
+        // (deliverable_instances excludes inactive + exit:*).
+        let delivered = crate::commands::send::send_message(
+            &db,
+            &crate::shared::SenderIdentity {
+                kind: crate::shared::SenderKind::Instance,
+                name: "operator".into(),
+                instance_data: None,
+                session_id: None,
+            },
+            "@midi ping",
+            None,
+            None,
+        )
+        .expect("send @midi must resolve after a live-omp stop");
+        assert_eq!(delivered, vec!["midi".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn stop_instance_killed_live_omp_pid_deletes_row() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id, pid, background)
+                 VALUES ('luna', 'listening', ?1, 'omp', 'sess-killed', ?2, 0)",
+                rusqlite::params![now, std::process::id() as i64],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "luna", "test", "killed");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "hcom kill must still DELETE the row while SIGTERM is still taking effect"
+        );
+    }
+
+    #[test]
+    fn stop_instance_dead_pid_still_deletes_row() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, pid, background)
+                 VALUES ('gone', 'omp', 'sess-dead', 'active', 'new', 0, 0, 99999999, 0)",
+                [],
+            )
+            .unwrap();
+
+        let outcome = stop_instance(&db, "gone", "test", "stop");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full("gone").unwrap().is_none(),
+            "dead pid keeps the existing delete semantics"
         );
     }
 

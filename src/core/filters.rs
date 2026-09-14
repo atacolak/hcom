@@ -407,10 +407,16 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
 
     // Collision filter
     if filters.contains_key("collision") {
+        // Scheme-prefixed internal URIs (xd://, agent://, memory://, …) are VFS
+        // tool devices, not shared product files — never collide on them. GLOB
+        // anchors at string start; real absolute paths start with '/' and never
+        // match. FILE_WRITE_CONTEXTS stays as-is: real omp writes to repo files
+        // must keep colliding.
         let collision_sql = format!(
             "(type = 'status' AND status_context IN {ctx}\n\
              AND events_v.status_detail IS NOT NULL\n\
              AND events_v.status_detail != ''\n\
+             AND events_v.status_detail NOT GLOB '[a-z]*://*'\n\
              AND EXISTS (\n\
              \x20   SELECT 1 FROM events_v e\n\
              \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
@@ -808,6 +814,46 @@ mod tests {
         insert("empty-b", "2026-06-07T12:00:21Z", "tool:Edit", Some(""));
         insert("null-a", "2026-06-07T12:00:22Z", "tool:Write", None);
         insert("null-b", "2026-06-07T12:00:23Z", "tool:Edit", None);
+
+        let mut filters = FilterMap::new();
+        filters.insert("collision".into(), vec!["true".into()]);
+        let where_sql = build_sql_from_flags(&filters).unwrap();
+        let query = format!("SELECT instance FROM events_v WHERE {where_sql} ORDER BY instance");
+        let mut stmt = db.conn().prepare(&query).unwrap();
+        let matches: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(matches, vec!["luna".to_string(), "nova".to_string()]);
+    }
+
+    #[test]
+    fn test_collision_filter_ignores_scheme_uri_details() {
+        let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
+        db.init_db().unwrap();
+
+        let insert = |instance: &str, timestamp: &str, detail: &str| {
+            let data = serde_json::json!({
+                "status": "active",
+                "context": "tool:write",
+                "detail": detail,
+            });
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'status', ?2, ?3)",
+                    rusqlite::params![timestamp, instance, data.to_string()],
+                )
+                .unwrap();
+        };
+
+        // Same VFS tool device, 1s apart, different instances: NOT a collision.
+        insert("midi", "2026-09-14T08:00:00Z", "xd://send_to_actor");
+        insert("kilo", "2026-09-14T08:00:01Z", "xd://send_to_actor");
+        // Same real filesystem path, 1s apart: still a collision.
+        insert("luna", "2026-09-14T08:00:02Z", "/home/sf/workspace/hcom/src/foo.rs");
+        insert("nova", "2026-09-14T08:00:03Z", "/home/sf/workspace/hcom/src/foo.rs");
 
         let mut filters = FilterMap::new();
         filters.insert("collision".into(), vec!["true".into()]);

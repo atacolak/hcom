@@ -147,6 +147,20 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                     &session_id,
                     &process_id,
                 )
+                .or_else(|| {
+                    // Row deleted behind a live process (hard stop): rebuild
+                    // from the life.stopped snapshot, then bind this session.
+                    if instance_binding::recreate_instance_from_stopped_snapshot(db, &name) {
+                        instance_binding::recover_process_binding_for_instance(
+                            db,
+                            &name,
+                            &session_id,
+                            &process_id,
+                        )
+                    } else {
+                        None
+                    }
+                })
             }) {
                 Some(name) => name,
                 None => {
@@ -243,7 +257,7 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
     (0, response.to_string())
 }
 
-pub(crate) fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
+pub(crate) fn handle_status(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
     let name = match parse_flag(argv, "--name") {
         Some(n) => n,
         None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
@@ -254,6 +268,41 @@ pub(crate) fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
     };
     let context = parse_flag(argv, "--context").unwrap_or_default();
     let detail = parse_flag(argv, "--detail").unwrap_or_default();
+
+    // Self-heal: a hook from a live process whose row was deleted out from
+    // under it (hard stop of a live process) restores the row from its
+    // life.stopped snapshot before writing — never write status into a hole.
+    if db.get_instance_full(&name).ok().flatten().is_none() {
+        if !instance_binding::recreate_instance_from_stopped_snapshot(db, &name) {
+            log_error(
+                "hooks",
+                "omp-status.row_missing",
+                &format!(
+                    "instance={name}: no row and no restorable snapshot; dropping status write"
+                ),
+            );
+            return (
+                0,
+                serde_json::json!({"error": format!("instance '{name}' has no row and could not be restored")}).to_string(),
+            );
+        }
+        // Re-bind what the delete cascaded away.
+        if let Some(row) = db.get_instance_full(&name).ok().flatten()
+            && let Some(sid) = row.session_id.as_deref().filter(|s| !s.is_empty())
+        {
+            let _ = db.clear_session_id_from_other_instances(sid, &name);
+            let _ = db.rebind_session(sid, &name);
+            if let Some(pid) = ctx.process_id.as_deref() {
+                let _ = db.set_process_binding(pid, sid, &name);
+            }
+        }
+        log_info(
+            "hooks",
+            "omp-status.row_restored",
+            &format!("instance={name}"),
+        );
+    }
+
     let was_listening = db
         .get_instance_full(&name)
         .ok()
@@ -522,7 +571,7 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
         ),
         || match hook_name_owned.as_str() {
             "omp-start" => handle_start(&ctx, &db, &handler_argv),
-            "omp-status" => handle_status(&db, &handler_argv),
+            "omp-status" => handle_status(&ctx, &db, &handler_argv),
             "omp-read" => handle_read(&db, &handler_argv),
             "omp-beforetool" => handle_beforetool(&db, &handler_argv),
             "omp-stop" => handle_stop(&db, &handler_argv),
@@ -831,5 +880,105 @@ mod tests {
         let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--format"]));
         assert!(!out.contains("auto"), "auto lane must not add noise: {out}");
         cleanup(path);
+    }
+
+    // ---- self-heal of a missing instances row (hard stop of a live process) ----
+
+    fn stopped_snapshot(db: &HcomDb, name: &str, session_id: &str) {
+        db.log_event(
+            "life",
+            name,
+            &serde_json::json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": name,
+                    "tool": "omp",
+                    "session_id": session_id,
+                    "directory": "/tmp",
+                    "pid": null
+                }
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn omp_status_restores_row_from_stopped_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        stopped_snapshot(&db, "midi", "sess-1");
+        assert!(db.get_instance_full("midi").unwrap().is_none());
+
+        let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let (code, out) = handle_status(
+            &ctx,
+            &db,
+            &argv(&["omp-status", "--name", "midi", "--status", "listening"]),
+        );
+
+        assert_eq!(code, 0);
+        assert!(out.contains("ok"), "unexpected output: {out}");
+        let row = db
+            .get_instance_full("midi")
+            .unwrap()
+            .expect("omp-status must restore the missing row before writing");
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    #[serial]
+    fn omp_status_without_snapshot_fails_closed() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let (code, out) = handle_status(
+            &ctx,
+            &db,
+            &argv(&["omp-status", "--name", "ghost", "--status", "listening"]),
+        );
+
+        assert_eq!(code, 0);
+        assert!(out.contains("error"), "expected fail-closed error: {out}");
+        assert!(db.get_instance_full("ghost").unwrap().is_none());
+        let status_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'ghost'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_events, 0, "must never write status into a hole");
+    }
+
+    #[test]
+    #[serial]
+    fn omp_start_restores_row_deleted_behind_live_process() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        stopped_snapshot(&db, "midi", "sess-1");
+        assert!(db.get_instance_full("midi").unwrap().is_none());
+
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-midi".to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let (code, out) = handle_start(
+            &ctx,
+            &db,
+            &argv(&["omp-start", "--session-id", "sess-1", "--cwd", "/tmp"]),
+        );
+
+        assert_eq!(code, 0);
+        assert!(out.contains("\"name\":\"midi\""), "unexpected output: {out}");
+        assert!(db.get_instance_full("midi").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sess-1").unwrap().as_deref(),
+            Some("midi")
+        );
     }
 }

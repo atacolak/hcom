@@ -410,8 +410,12 @@ fn start_rebind(
     let child_links = snapshot_child_links(db, session_id.as_deref())?;
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
-    if let Some(ref meta) = target_meta {
-        ensure_rebind_compatible(&target_name, meta, ctx)?;
+    let effective_tool = target_meta
+        .as_ref()
+        .map(|meta| rebind_effective_tool(ctx, meta))
+        .unwrap_or(ctx.tool);
+    if let Some(meta) = &target_meta {
+        ensure_rebind_compatible(&target_name, meta, effective_tool.as_str(), ctx)?;
     }
 
     // Preserve last_event_id from target (cursor preservation)
@@ -448,7 +452,7 @@ fn start_rebind(
     }
 
     // Create fresh instance with the target name
-    let tool = ctx.tool.as_str();
+    let tool = effective_tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
     instance_binding::initialize_instance_in_position_file(
         db,
@@ -564,17 +568,37 @@ struct RebindTargetMetadata {
     last_event_id: i64,
 }
 
+/// Tool identity for an `--as` reclaim. Native markers correctly win detection
+/// for NEW sessions, but on reclaim a leaked marker (e.g. `CLAUDECODE=1`
+/// inherited from a supervisor process) must not override hcom's explicit
+/// declaration or the target's recorded identity. Precedence: `HCOM_TOOL`,
+/// then the target's latest tool (live row or stopped snapshot), then
+/// detection.
+fn rebind_effective_tool(ctx: &HcomContext, meta: &RebindTargetMetadata) -> crate::tool::Tool {
+    if let Some(declared) = ctx.raw_env.get("HCOM_TOOL").filter(|v| !v.is_empty())
+        && let Ok(tool) = declared.parse::<crate::tool::Tool>()
+    {
+        return tool;
+    }
+    if !meta.tool.is_empty()
+        && let Ok(tool) = meta.tool.parse::<crate::tool::Tool>()
+    {
+        return tool;
+    }
+    ctx.tool
+}
+
 fn ensure_rebind_compatible(
     target_name: &str,
     meta: &RebindTargetMetadata,
+    effective_tool: &str,
     ctx: &HcomContext,
 ) -> Result<()> {
-    let current_tool = ctx.tool.as_str();
-    if !meta.tool.is_empty() && meta.tool != current_tool {
+    if !meta.tool.is_empty() && meta.tool != effective_tool {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
             meta.tool,
-            current_tool
+            effective_tool
         );
     }
 
@@ -909,6 +933,27 @@ mod tests {
             env.insert(key.to_string(), value.to_string());
         }
         HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    /// Context for `--as` reclaim tests: ambient `HCOM_TOOL`/`CLAUDECODE` are
+    /// removed so the outcome is decided by the code under test, not the shell
+    /// running the tests.
+    fn make_rebind_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("HCOM_TOOL");
+        env.remove("CLAUDECODE");
+        for (k, v) in tool_env {
+            env.insert((*k).to_string(), (*v).to_string());
+        }
+        HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    fn rebind_meta(tool: &str, directory: &str) -> RebindTargetMetadata {
+        RebindTargetMetadata {
+            tool: tool.to_string(),
+            directory: directory.to_string(),
+            last_event_id: 0,
+        }
     }
 
     fn log_stopped_snapshot(
@@ -1319,7 +1364,7 @@ mod tests {
             .issue_claude_actor_capability("sess-1", "tool-child", Some("agent-1"), "nova_task_1")
             .unwrap();
 
-        let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        let ctx = make_rebind_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
         assert_eq!(start_rebind(&db, "nova", &ctx, Some("nova")).unwrap(), 0);
 
         let child = db.get_instance_full("nova_task_1").unwrap().unwrap();
@@ -1347,7 +1392,7 @@ mod tests {
             42,
         );
 
-        let ctx = make_ctx(
+        let ctx = make_rebind_ctx(
             &[("CLAUDECODE", "1")],
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );
@@ -1377,7 +1422,7 @@ mod tests {
             77,
         );
 
-        let ctx = make_ctx(
+        let ctx = make_rebind_ctx(
             &[("CLAUDECODE", "1")],
             "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
         );
@@ -1395,6 +1440,76 @@ mod tests {
     }
 
     #[test]
+    fn rebind_effective_tool_prefers_hcom_tool_over_leaked_native_marker() {
+        let ctx = make_rebind_ctx(&[("CLAUDECODE", "1"), ("HCOM_TOOL", "omp")], "/tmp/project");
+        assert_eq!(
+            ctx.tool,
+            crate::tool::Tool::Claude,
+            "native-first detection is unchanged for new sessions"
+        );
+        let meta = rebind_meta("omp", "/tmp/project");
+        let effective = rebind_effective_tool(&ctx, &meta);
+        assert_eq!(effective, crate::tool::Tool::Omp);
+        assert!(ensure_rebind_compatible("midi", &meta, effective.as_str(), &ctx).is_ok());
+    }
+
+    #[test]
+    fn rebind_effective_tool_prefers_snapshot_over_leaked_native_marker() {
+        let ctx = make_rebind_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        let meta = rebind_meta("omp", "/tmp/project");
+        assert_eq!(
+            rebind_effective_tool(&ctx, &meta),
+            crate::tool::Tool::Omp,
+            "leaked CLAUDECODE must not refuse reclaim of an omp identity"
+        );
+    }
+
+    #[test]
+    fn rebind_effective_tool_explicit_mismatch_still_refuses() {
+        let ctx = make_rebind_ctx(&[("CLAUDECODE", "1"), ("HCOM_TOOL", "claude")], "/tmp/project");
+        let meta = rebind_meta("omp", "/tmp/project");
+        let effective = rebind_effective_tool(&ctx, &meta);
+        assert_eq!(effective, crate::tool::Tool::Claude);
+        assert!(
+            ensure_rebind_compatible("midi", &meta, effective.as_str(), &ctx).is_err(),
+            "explicit HCOM_TOOL=claude reclaiming an omp identity is a real mismatch"
+        );
+    }
+
+    #[test]
+    fn rebind_effective_tool_empty_metadata_falls_back_to_detection() {
+        let claude_ctx = make_rebind_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        assert_eq!(
+            rebind_effective_tool(&claude_ctx, &rebind_meta("", "")),
+            crate::tool::Tool::Claude,
+            "no HCOM_TOOL and no recorded identity: detection decides"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn start_rebind_reclaims_stopped_omp_identity_with_leaked_native_marker() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+
+        log_stopped_snapshot(&db, "midi", "omp", "/tmp/project", "sid-midi", 12);
+
+        // A supervisor-inherited CLAUDECODE=1 must not turn a legitimate omp
+        // reclaim into a cross-tool refusal.
+        let ctx = make_rebind_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
+        assert_eq!(ctx.tool, crate::tool::Tool::Claude);
+
+        let exit_code = start_rebind(&db, "midi", &ctx, None).unwrap();
+        assert_eq!(exit_code, 0);
+
+        let inst = db.get_instance_full("midi").unwrap().unwrap();
+        assert_eq!(
+            inst.tool, "omp",
+            "reclaimed row must record the effective (snapshot) tool"
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_start_rebind_rejects_cross_directory_stopped_snapshot_hijack() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -1409,7 +1524,7 @@ mod tests {
             18,
         );
 
-        let ctx = make_ctx(
+        let ctx = make_rebind_ctx(
             &[("CLAUDECODE", "1")],
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );

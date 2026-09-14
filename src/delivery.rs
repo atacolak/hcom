@@ -713,6 +713,17 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     }
 }
 
+/// Whether the delivery loop may PTY-inject the first-message bootstrap for
+/// this tool. OMP's composer contents are not observable
+/// (`get_input_box_text` returns `None` for omp), so a blind inject+Enter can
+/// append to — and submit — an operator's in-progress draft. The omp plugin
+/// owns delivery end-to-end (notify-server wake → `sendUserMessage`), and
+/// launch readiness already requires the plugin bind
+/// (`launch_ready_on_plugin_bind`), so omp skips the PTY bootstrap entirely.
+fn pty_bootstrap_inject_allowed(tool: Option<crate::tool::Tool>) -> bool {
+    !matches!(tool, Some(crate::tool::Tool::Omp))
+}
+
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
 /// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
@@ -1702,7 +1713,10 @@ pub fn run_delivery_loop(
                     ),
                 );
             }
-            if !first_message_injected && db.has_pending(&current_name) {
+            if !first_message_injected
+                && pty_bootstrap_inject_allowed(Tool::from_str(&config.tool).ok())
+                && db.has_pending(&current_name)
+            {
                 let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                 let input_box_width = (cols as usize).saturating_sub(15).max(10);
                 let text = build_wake_inject_text(db, &current_name, input_box_width);
@@ -3308,5 +3322,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(build_wake_inject_text(&db, "keno", 24), "<hcom>");
+    }
+
+    #[test]
+    fn omp_never_pty_bootstrap_injects() {
+        use crate::tool::Tool;
+        // OMP's composer is unobservable (screen input extraction returns
+        // None), so a blind PTY inject+Enter can submit an operator's draft.
+        // The omp plugin owns delivery via sendUserMessage; skip the bootstrap.
+        assert!(!pty_bootstrap_inject_allowed(Some(Tool::Omp)));
+        for tool in [Tool::OpenCode, Tool::Kilo, Tool::Pi, Tool::Claude, Tool::Gemini] {
+            assert!(
+                pty_bootstrap_inject_allowed(Some(tool)),
+                "{tool:?} keeps its first-message PTY bootstrap"
+            );
+        }
     }
 }

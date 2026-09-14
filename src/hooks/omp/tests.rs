@@ -376,7 +376,9 @@ fn status_handler_wakes_plugin_only_when_entering_listening() {
         "--status".to_string(),
         ST_LISTENING.to_string(),
     ];
-    let (code, _) = handle_status(&db, &argv);
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+    let (code, _) = handle_status(&ctx, &db, &argv);
     assert_eq!(code, 0);
     std::thread::sleep(Duration::from_millis(20));
     assert!(listener.accept().is_err());
@@ -385,7 +387,7 @@ fn status_handler_wakes_plugin_only_when_entering_listening() {
     updates.insert("status".into(), serde_json::json!(ST_ACTIVE));
     instances::update_instance_position(&db, "luna", &updates);
 
-    let (code, _) = handle_status(&db, &argv);
+    let (code, _) = handle_status(&ctx, &db, &argv);
     assert_eq!(code, 0);
     let mut accepted = false;
     for _ in 0..10 {
