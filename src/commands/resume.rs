@@ -482,8 +482,7 @@ fn prepare_resume_plan_from_source(
     } else {
         Vec::new()
     };
-    let mut persisted_args = original_args.clone();
-    persisted_args.extend(clean_extra.iter().cloned());
+    let persisted_args = build_persisted_args(&tool, &original_args, &clean_extra);
 
     let mut cli_tool_args = match &resume_session {
         Some(session_id) => build_resume_args(&tool, session_id, fork),
@@ -2064,6 +2063,97 @@ fn ambiguous_pi_omp_session(session_id: &str) -> Option<String> {
     }
 }
 
+/// Session-selector flags that take their value as the next token
+/// (`--resume <id>`, `-r <id>`, `--session-dir <dir>`, `--fork <id>`).
+const SESSION_SELECTOR_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--resume",
+    "--session",
+    "--session-id",
+    "--session-dir",
+    "--fork",
+];
+
+/// Boolean session selectors (no value token).
+const SESSION_SELECTOR_BOOLEAN_FLAGS: &[&str] = &["-c", "--continue"];
+
+/// Session selectors that carry their value inline (`--resume=<id>`).
+const SESSION_SELECTOR_INLINE_PREFIXES: &[&str] = &[
+    "--resume=",
+    "--session=",
+    "--session-id=",
+    "--session-dir=",
+    "--fork=",
+];
+
+/// If `args[i]` selects a session, return the index just past it and its value.
+///
+/// One definition of the selector grammar for both consumers: the live-argv
+/// merge ([`merge_omp_args`]) and the persisted-args strip
+/// ([`strip_session_selectors`]). A value token is consumed only when it does
+/// not itself look like a flag, so `--session-dir --model opus` keeps `--model`.
+fn session_selector_end(args: &[String], i: usize) -> Option<usize> {
+    let token = args[i].as_str();
+
+    if SESSION_SELECTOR_VALUE_FLAGS.contains(&token) {
+        let mut end = i + 1;
+        if end < args.len() && !args[end].starts_with('-') {
+            end += 1;
+        }
+        return Some(end);
+    }
+    if SESSION_SELECTOR_BOOLEAN_FLAGS.contains(&token)
+        || SESSION_SELECTOR_INLINE_PREFIXES
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+    {
+        return Some(i + 1);
+    }
+    None
+}
+
+/// Drop session selectors and their values from a stored `launch_args` vector.
+///
+/// `launch_args` persists user/config flags only: the tool's session identity
+/// lives in `instances.session_id`, and hcom re-injects the selector on every
+/// resume/fork. A selector captured into the stored vector is therefore never
+/// honored (the merge functions strip it from the live argv anyway) but is
+/// replayed into the next persist, so it would grow by one copy per recycle.
+fn strip_session_selectors(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len());
+    let mut i = 0;
+
+    while i < args.len() {
+        if let Some(end) = session_selector_end(args, i) {
+            i = end;
+            continue;
+        }
+        kept.push(args[i].clone());
+        i += 1;
+    }
+
+    kept
+}
+
+/// Build the `launch_args` vector persisted for future resumes/fork.
+///
+/// Only tools whose selector grammar [`session_selector_end`] describes are
+/// stripped; the rest store `original_args + clean_extra` verbatim.
+fn build_persisted_args(
+    tool: &str,
+    original_args: &[String],
+    clean_extra: &[String],
+) -> Vec<String> {
+    let mut persisted: Vec<String> = original_args.to_vec();
+    persisted.extend(clean_extra.iter().cloned());
+
+    if matches!(tool.parse::<crate::tool::Tool>(), Ok(crate::tool::Tool::Omp)) {
+        persisted = strip_session_selectors(&persisted);
+    }
+
+    persisted
+}
+
 /// Merge `omp` transcript arguments for a resumed or forked session.
 ///
 /// Omp uses `--resume <id>` and `--fork <id>`, and lacks `--session`.
@@ -2072,31 +2162,13 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
     let mut i = 0;
 
     while i < original.len() {
+        if let Some(end) = session_selector_end(original, i) {
+            i = end;
+            continue;
+        }
+
         let token = &original[i];
-        let token_str = token.as_str();
-
-        if matches!(
-            token_str,
-            "-r" | "--resume" | "--session" | "--session-id" | "--session-dir" | "--fork"
-        ) {
-            i += 1;
-            if i < original.len() && !original[i].starts_with('-') {
-                i += 1;
-            }
-            continue;
-        }
-        if matches!(token_str, "-c" | "--continue")
-            || token_str.starts_with("--resume=")
-            || token_str.starts_with("--session=")
-            || token_str.starts_with("--session-id=")
-            || token_str.starts_with("--session-dir=")
-            || token_str.starts_with("--fork=")
-        {
-            i += 1;
-            continue;
-        }
-
-        if !token_str.starts_with('-') {
+        if !token.starts_with('-') {
             i += 1;
             continue;
         }
@@ -2599,6 +2671,77 @@ mod tests {
         assert_eq!(
             merge_omp_args(&s(&["--session-dir", "--model", "opus"]), &resume),
             s(&["--resume", "new", "--model", "opus"])
+        );
+    }
+
+    #[test]
+    fn test_build_persisted_args_strips_session_selectors() {
+        // Recycle accumulation, reproduced: the stored vector already carries
+        // the selector a previous recycle persisted, and this launch's extra
+        // args carry it again (worlds injects a trailing `--resume <pane
+        // transcript>` so omp last-wins).
+        let transcript = "/home/sf/.omp/agent/sessions/59898.jsonl";
+        let stored = s(&["--model", "opus", "--resume", transcript]);
+        let extra = s(&["--resume", transcript]);
+
+        assert_eq!(
+            build_persisted_args("omp", &stored, &extra),
+            s(&["--model", "opus"])
+        );
+
+        // Every spelling of the selector grammar is dropped; config flags are
+        // kept (session identity lives in instances.session_id).
+        assert_eq!(
+            build_persisted_args(
+                "omp",
+                &s(&[
+                    "-r",
+                    "old",
+                    "--fork=parent",
+                    "--continue",
+                    "--thinking",
+                    "high",
+                ]),
+                &s(&["--resume=other.jsonl", "--session-dir", "/tmp/s"]),
+            ),
+            s(&["--thinking", "high"])
+        );
+    }
+
+    #[test]
+    fn test_live_argv_keeps_one_resume_injection_after_persist_strip() {
+        let transcript = "/home/sf/.omp/agent/sessions/59898.jsonl";
+        let stored = s(&["--model", "opus", "--resume", transcript]);
+
+        // A plain resume injects exactly one `--resume` for this launch, even
+        // though the stored vector still carries the previous recycle's copy.
+        let live = merge_resume_args(
+            "omp",
+            &stored,
+            &build_resume_args("omp", "sess-omp", false),
+        );
+        assert_eq!(
+            live.iter().filter(|arg| arg.as_str() == "--resume").count(),
+            1
+        );
+        assert_eq!(live, s(&["--resume", "sess-omp", "--model", "opus"]));
+
+        // A caller-supplied trailing selector (worlds') still lands after
+        // hcom's injection, so omp last-wins. Stripping the persisted copy does
+        // not dedup the live vector.
+        let mut cli_args = build_resume_args("omp", "sess-omp", false);
+        cli_args.push("--resume".to_string());
+        cli_args.push(transcript.to_string());
+        assert_eq!(
+            merge_resume_args("omp", &stored, &cli_args),
+            s(&[
+                "--resume",
+                "sess-omp",
+                "--resume",
+                transcript,
+                "--model",
+                "opus",
+            ])
         );
     }
 
@@ -3421,6 +3564,17 @@ mod tests {
     /// Seed one `stopped` life snapshot for `name` in `directory`. Each call
     /// inserts a new event row, so later calls are newer (ORDER BY id DESC).
     fn seed_stopped_session(db: &HcomDb, name: &str, session_id: &str, directory: &str) {
+        seed_stopped_session_with_args(db, name, session_id, directory, "[]");
+    }
+
+    /// [`seed_stopped_session`] with an explicit `launch_args` JSON array.
+    fn seed_stopped_session_with_args(
+        db: &HcomDb,
+        name: &str,
+        session_id: &str,
+        directory: &str,
+        launch_args: &str,
+    ) {
         let mut data = serde_json::Map::new();
         data.insert("session_id".into(), json!(session_id));
         data.insert("tool".into(), json!("omp"));
@@ -3433,7 +3587,7 @@ mod tests {
             "snapshot": {
                 "tool": "omp",
                 "session_id": session_id,
-                "launch_args": "[]",
+                "launch_args": launch_args,
                 "tag": "",
                 "background": 0,
                 "last_event_id": 0,
@@ -3525,6 +3679,74 @@ mod tests {
             plan.launch.args
         );
         assert_eq!(plan.launch.prior_session_id.as_deref(), Some(sid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_recycle_persists_launch_args_without_session_selectors() {
+        let (_dir, home, _guard) = isolated_omp_root();
+        let sid = "01a0948d-recy-7000-8000-000000000003";
+        let root = home
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(format!("2026-01-01T00-00-00.000Z_{sid}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let transcript = "/home/sf/.omp/agent/sessions/pane-59898.jsonl";
+        let db = test_db();
+        // A previous recycle already stored the selector worlds injected.
+        seed_stopped_session_with_args(
+            &db,
+            "tori",
+            sid,
+            "/tmp",
+            &json!(["--model", "opus", "--resume", transcript]).to_string(),
+        );
+
+        // This recycle: worlds appends the same selector again (omp last-wins).
+        let plan = prepare_resume_plan(
+            &db,
+            "tori",
+            false,
+            &["--resume".to_string(), transcript.to_string()],
+            &GlobalFlags::default(),
+        )
+        .unwrap();
+
+        let persisted = plan.launch.persisted_args.clone().unwrap();
+        assert!(
+            !persisted
+                .iter()
+                .any(|arg| arg == "--resume" || arg == "--fork" || arg == "-r" || arg == transcript),
+            "launch_args must not accumulate session selectors, got {persisted:?}"
+        );
+        assert_eq!(persisted, s(&["--model", "opus"]));
+
+        // The live argv for this launch is untouched: hcom's one `--resume`
+        // injection, then the caller's override (omp last-wins).
+        assert_eq!(
+            plan.launch.args,
+            s(&[
+                "--resume",
+                sid,
+                "--resume",
+                transcript,
+                "--model",
+                "opus",
+            ])
+        );
+        assert_eq!(
+            plan.launch.args.iter().filter(|a| *a == sid).count(),
+            1,
+            "hcom injects exactly one resume session for this launch"
+        );
     }
 
     // Unix-only: relies on redirecting the home dir via `isolated_test_env`'s
