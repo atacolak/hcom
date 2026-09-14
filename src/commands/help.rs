@@ -246,6 +246,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  --as-instance",
         "Send as your own bound instance identity (fails if unbound)",
     ),
+    (
+        "  --as-system <source-id>",
+        "System sender identity (requires @targets, never broadcasts)",
+    ),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
     ("  --title <text>", "Create and attach bundle inline"),
@@ -384,7 +388,10 @@ const STOP_HELP: &[HelpEntry] = &[
 ];
 
 const DISCARD_HELP: &[HelpEntry] = &[
-    ("discard <name>", "Discard a never-committed provisional identity"),
+    (
+        "discard <name>",
+        "Discard a never-committed provisional identity",
+    ),
     ("  --json", "Machine-readable output"),
     ("  --go", "Confirm when run inside an AI tool"),
     ("", ""),
@@ -964,12 +971,18 @@ Commands:\n\
 /// `--run-here` is unset (`will_run_in_current_terminal`).
 const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--tag <name>", "Group tag (names become tag-*)"),
-    ("--terminal <preset>", "Where new windows open (`here` = this pane)"),
+    (
+        "--terminal <preset>",
+        "Where new windows open (`here` = this pane)",
+    ),
     ("--dir <path>", "Working directory"),
     ("--headless", "Run in background"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
-    ("--run-here", "Resume/launch in this pane (do not mint a new tab)"),
+    (
+        "--run-here",
+        "Resume/launch in this pane (do not mint a new tab)",
+    ),
 ];
 
 /// Shared help body for `hcom r` / `hcom f` (both accept the same target
@@ -1301,5 +1314,14 @@ mod tests {
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
         assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
+    }
+
+    #[test]
+    fn send_help_lists_as_system() {
+        let help = get_command_help("send");
+        assert!(
+            help.contains("--as-system <source-id>"),
+            "send help should list --as-system"
+        );
     }
 }

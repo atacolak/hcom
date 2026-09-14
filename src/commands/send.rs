@@ -109,6 +109,10 @@ pub struct SendArgs {
     #[arg(long = "as-instance")]
     pub as_instance: bool,
 
+    /// System sender identity (addressed @targets required, never broadcasts)
+    #[arg(long = "as-system")]
+    pub as_system: Option<String>,
+
     /// Suppress output
     #[arg(long)]
     pub quiet: bool,
@@ -709,13 +713,32 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     }
 
+    if args.as_system.is_some() && (from_name.is_some() || args.as_instance) {
+        eprintln!("Error: --as-system cannot be combined with --from/-b/--as-instance");
+        return 1;
+    }
+
+    if let Some(id) = &args.as_system {
+        if id.is_empty() || id.len() > 50 {
+            eprintln!("Error: Source id must be 1-50 characters (got {})", id.len());
+            return 1;
+        }
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+        {
+            eprintln!("Error: Source id must be alphanumeric with hyphens/underscores/colons");
+            return 1;
+        }
+    }
+
     if args.as_instance && from_name.is_some() {
         eprintln!("Error: --as-instance cannot be combined with --from/-b");
         return 1;
     }
 
-    // Guard: subagents cannot use --from/-b
-    if from_name.is_some() {
+    // Guard: subagents cannot use --from/-b/--as-system
+    if from_name.is_some() || args.as_system.is_some() {
         let actor_from_ctx = ctx.and_then(|c| c.identity.clone());
         let actor = actor_from_ctx
             .or_else(|| identity::resolve_identity(db, None, None, None, None, None, None).ok());
@@ -727,7 +750,9 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                         .and_then(|v| v.as_str())
                         .is_some_and(|s| !s.is_empty())
                 {
-                    eprintln!("Error: Subagents cannot use --from/-b (external sender spoofing)");
+                    eprintln!(
+                        "Error: Subagents cannot use --from/-b/--as-system (sender spoofing)"
+                    );
                     return 1;
                 }
             }
@@ -880,6 +905,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 return 1;
             }
         }
+    } else if let Some(source_id) = &args.as_system {
+        SenderIdentity {
+            kind: SenderKind::System,
+            name: source_id.clone(),
+            instance_data: None,
+            session_id: None,
+        }
     } else if let Some(ref name) = from_name {
         SenderIdentity {
             kind: SenderKind::External,
@@ -943,6 +975,15 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+
+    // Trap settlement: --as-system is addressed-only. A recipient-less send
+    // would broadcast to the village — refuse before anything is written.
+    if args.as_system.is_some() && preview_delivery.original_scope == MessageScope::Broadcast {
+        eprintln!(
+            "Error: --as-system requires at least one @recipient. Refusing to broadcast to the village. No message sent."
+        );
+        return 1;
+    }
 
     if is_inside_ai_tool()
         && !ctx.map(|c| c.go).unwrap_or(false)
@@ -1809,7 +1850,8 @@ mod tests {
 
     #[test]
     fn parse_as_instance_flag() {
-        let args = SendArgs::try_parse_from(["send", "--as-instance", "@luna", "--", "hi"]).unwrap();
+        let args =
+            SendArgs::try_parse_from(["send", "--as-instance", "@luna", "--", "hi"]).unwrap();
         assert!(args.as_instance);
     }
 
@@ -2079,7 +2121,14 @@ mod tests {
             delivery: crate::messages::DeliveryLane::Steer,
             ..Default::default()
         };
-        send_message(&db, &sender, "hi", Some(&envelope), Some(&["nova".to_string()])).unwrap();
+        send_message(
+            &db,
+            &sender,
+            "hi",
+            Some(&envelope),
+            Some(&["nova".to_string()]),
+        )
+        .unwrap();
         let stored: String = db
             .conn()
             .query_row(
@@ -2118,6 +2167,225 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "auto");
+        cleanup_test_db(path);
+    }
+
+    // ── --as-system tests ──
+
+    #[test]
+    fn parse_as_system_flag() {
+        let args = SendArgs::try_parse_from([
+            "send", "--as-system", "omp-runtime", "@gina", "--", "msg",
+        ])
+        .unwrap();
+        assert_eq!(args.as_system.as_deref(), Some("omp-runtime"));
+
+        let args = SendArgs::try_parse_from([
+            "send", "--as-system=omp-runtime", "@gina", "--", "msg",
+        ])
+        .unwrap();
+        assert_eq!(args.as_system.as_deref(), Some("omp-runtime"));
+    }
+
+    #[test]
+    #[serial]
+    fn as_system_send_writes_system_sender_event() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('gina', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let mut args = SendArgs::try_parse_from([
+            "send", "--as-system", "omp-runtime", "@gina",
+            "--intent", "inform", "--", "gen published",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        let code = cmd_send(&db, &args, None);
+        assert_eq!(code, 0);
+
+        let (instance, from, sender_kind, scope, delivered_to): (
+            String, String, String, String, String,
+        ) = db
+            .conn()
+            .query_row(
+                "SELECT instance,
+                        json_extract(data, '$.from'),
+                        json_extract(data, '$.sender_kind'),
+                        json_extract(data, '$.scope'),
+                        json_extract(data, '$.delivered_to')
+                 FROM events WHERE type = 'message'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(instance, "sys_omp-runtime");
+        assert_eq!(from, "omp-runtime");
+        assert_eq!(sender_kind, "system");
+        assert_eq!(scope, "mentions");
+        assert_eq!(delivered_to, "[\"gina\"]");
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_system_conflicts_with_from() {
+        let (db, path, _env) = setup_test_db();
+        let mut args = SendArgs::try_parse_from([
+            "send", "--as-system", "omp-runtime", "--from", "healthcheck",
+            "@gina", "--", "x",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(cmd_send(&db, &args, None), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_system_conflicts_with_as_instance() {
+        let (db, path, _env) = setup_test_db();
+        let mut args = SendArgs::try_parse_from([
+            "send", "--as-system", "omp-runtime", "--as-instance", "@gina", "--", "x",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(cmd_send(&db, &args, None), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_system_source_id_validation() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('gina', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        for bad in ["@bad", "bad;id", &"x".repeat(51)] {
+            let mut args = SendArgs::try_parse_from([
+                "send", "--as-system", bad, "@gina", "--", "x",
+            ])
+            .unwrap();
+            args.had_separator = true;
+            assert_eq!(cmd_send(&db, &args, None), 1, "should reject: {bad}");
+        }
+
+        // Colons and hyphens are valid (systemd-ops:<operation-stem>)
+        let mut args = SendArgs::try_parse_from([
+            "send", "--as-system", "systemd-ops:operation-stem", "@gina", "--", "x",
+        ])
+        .unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, None), 0);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_system_without_recipient_refuses_broadcast() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('gina', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let mut args = SendArgs::try_parse_from([
+            "send", "--as-system", "omp-runtime", "--intent", "inform", "--", "x",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(cmd_send(&db, &args, None), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no event may be written for a recipient-less --as-system send"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn from_flag_still_external_sender() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('gina', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let mut args = SendArgs::try_parse_from([
+            "send", "--from", "healthcheck", "@gina", "--", "hi",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(cmd_send(&db, &args, None), 0);
+        let (from, sender_kind): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.from'), json_extract(data, '$.sender_kind')
+                 FROM events WHERE type = 'message'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(from, "healthcheck");
+        assert_eq!(sender_kind, "external");
+
         cleanup_test_db(path);
     }
 }

@@ -50,6 +50,15 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
+/// Whether argv carries a sender flag that bypasses the send identity gate
+/// (--from, -b, --as-system). Scans raw argv because the gate decision
+/// happens before clap parsing.
+fn send_has_external_sender_flag(cmd_argv: &[String]) -> bool {
+    cmd_argv.iter().any(|a| {
+        a == "--from" || a == "-b" || a == "--as-system" || a.starts_with("--as-system=")
+    })
+}
+
 fn maybe_external_send_name_hint(
     cmd: &str,
     explicit_name: Option<&str>,
@@ -743,7 +752,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let codex_thread_id = std::env::var("CODEX_THREAD_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
+    let has_from_flag = send_has_external_sender_flag(&cmd_argv);
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
         &db,
@@ -1014,6 +1023,21 @@ mod tests {
             "send", "@lovi", "--", "update"
         ])));
         assert!(!is_update_invocation(&[]));
+    }
+
+    #[test]
+    fn send_gate_bypass_flags() {
+        assert!(send_has_external_sender_flag(&sv(&["--from", "x"])));
+        assert!(send_has_external_sender_flag(&sv(&["-b"])));
+        assert!(send_has_external_sender_flag(&sv(&[
+            "--as-system",
+            "omp-runtime"
+        ])));
+        assert!(send_has_external_sender_flag(&sv(&[
+            "--as-system=omp-runtime"
+        ])));
+        assert!(!send_has_external_sender_flag(&sv(&["--intent", "inform"])));
+        assert!(!send_has_external_sender_flag(&[]));
     }
 
     // ── resolve_action tests ────────────────────────────────────────────

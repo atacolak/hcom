@@ -20,14 +20,15 @@ pub enum SenderKind {
     Instance,
     /// External sender via --from flag (broadcasts to all).
     External,
-    /// System-generated message (broadcasts to all).
+    /// System-generated message (addressed delivery; does not broadcast).
     System,
 }
 
 impl SenderIdentity {
-    /// External and system senders broadcast to everyone.
+    /// External senders broadcast to everyone. System senders are
+    /// addressed-only: `hcom send --as-system` requires explicit @targets.
     pub fn broadcasts(&self) -> bool {
-        matches!(self.kind, SenderKind::External | SenderKind::System)
+        matches!(self.kind, SenderKind::External)
     }
 
     /// Group session ID for routing (session-based group membership).
@@ -96,7 +97,7 @@ mod tests {
             instance_data: None,
             session_id: None,
         };
-        assert!(system.broadcasts());
+        assert!(!system.broadcasts());
     }
 
     #[test]
