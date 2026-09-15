@@ -92,6 +92,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "cwd": remote_cwd,
             "initial_prompt": hcom_flags.initial_prompt,
             "system_prompt": hcom_flags.system_prompt,
+            "name": hcom_flags.instance,
         });
 
         match crate::relay::control::dispatch_remote(
@@ -195,7 +196,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
             batch_id: hcom_flags.batch_id,
-            name: None, // --name is caller identity, not instance name
+            // --name stays caller identity (resolve_launcher_name /
+            // HCOM_LAUNCHED_BY); --instance is the launch mint request.
+            name: hcom_flags.instance,
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
@@ -440,6 +443,7 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    pub instance: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -489,6 +493,12 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
     idx += 1;
 
     let (flags, tool_args) = extract_launch_flags(&argv[idx..]);
+
+    if let Some(name) = &flags.instance
+        && name.trim().is_empty()
+    {
+        bail!("--instance requires a non-empty instance name");
+    }
 
     Ok((count, tool, flags, tool_args))
 }
@@ -602,6 +612,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--instance=") {
+            flags.instance = Some(args[i][11..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
@@ -617,6 +632,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             }
             "--dir" if i + 1 < args.len() => {
                 flags.dir = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--instance" if i + 1 < args.len() => {
+                flags.instance = Some(args[i + 1].clone());
                 i += 2;
             }
             "--headless" => {
@@ -1390,5 +1409,34 @@ mod tests {
             parse_launch_argv(&s(&["gemini", "--dir", "/tmp/proj", "-m", "flash"])).unwrap();
         assert_eq!(flags.dir, Some("/tmp/proj".to_string()));
         assert_eq!(args, s(&["-m", "flash"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_instance_space_form() {
+        let (_, tool, flags, args) = parse_launch_argv(&s(&["omp", "--instance", "reko"])).unwrap();
+        assert_eq!(tool, "omp");
+        assert_eq!(flags.instance, Some("reko".to_string()));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_launch_argv_instance_equals_form() {
+        let (_, _, flags, _) = parse_launch_argv(&s(&["omp", "--instance=reko"])).unwrap();
+        assert_eq!(flags.instance, Some("reko".to_string()));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_instance_after_tool_args() {
+        // Order-independent, like --tag: extracted even after tool-specific args.
+        let (_, _, flags, args) =
+            parse_launch_argv(&s(&["omp", "--model", "fast", "--instance", "reko"])).unwrap();
+        assert_eq!(flags.instance, Some("reko".to_string()));
+        assert_eq!(args, s(&["--model", "fast"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_instance_empty_fails() {
+        assert!(parse_launch_argv(&s(&["omp", "--instance", ""])).is_err());
+        assert!(parse_launch_argv(&s(&["omp", "--instance", "   "])).is_err());
     }
 }

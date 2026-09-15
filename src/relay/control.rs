@@ -688,6 +688,7 @@ struct RemoteLaunchRequest {
     background: bool,
     terminal: Option<String>,
     cwd: Option<String>,
+    name: Option<String>,
 }
 
 impl RemoteLaunchRequest {
@@ -707,6 +708,7 @@ impl RemoteLaunchRequest {
             background: bool_param(params, "background", false),
             terminal: optional_param(params, "terminal").map(ToString::to_string),
             cwd: optional_param(params, "cwd").map(ToString::to_string),
+            name: optional_param(params, "name").map(ToString::to_string),
         })
     }
 }
@@ -790,7 +792,7 @@ fn handle_remote_launch(
             // is not safe even for single interactive launches.
             run_here: Some(false),
             batch_id: None,
-            name: None,
+            name: request.name,
             skip_validation: false,
             terminal: request.terminal,
             append_reply_handoff: false,
@@ -1478,6 +1480,24 @@ mod tests {
         .unwrap();
         assert_eq!(request.terminal.as_deref(), Some("kitty-tab"));
         assert_eq!(request.launcher.as_deref(), Some("rega"));
+    }
+
+    #[test]
+    fn test_remote_launch_request_from_params_collects_name() {
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "name": "reko"
+        }))
+        .unwrap();
+        assert_eq!(request.name.as_deref(), Some("reko"));
+    }
+
+    #[test]
+    fn test_remote_launch_request_from_params_name_defaults_none() {
+        let request =
+            RemoteLaunchRequest::from_params(&json!({"tool": "claude", "count": 1})).unwrap();
+        assert!(request.name.is_none());
     }
 
     #[test]

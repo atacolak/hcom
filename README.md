@@ -314,6 +314,7 @@ hcom launch flags:
 | Flag | Purpose |
 |---|---|
 | `--tag <name>` | Group label — agents can be addressed as `@tag` |
+| `--instance <name>` | Mint this name for the launched instance (fails if taken) |
 | `--terminal <preset>` | Where windows open: `default` (auto-detect), `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, etc… |
 | `--dir <path>` | Directory where the agent launches |
 | `--headless` | Run in background pty with no terminal window |

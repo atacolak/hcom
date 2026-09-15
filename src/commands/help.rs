@@ -743,6 +743,10 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
         "    {:<29}{}",
         "--device <name>", "Launch on a remote relay device"
     ));
+    lines.push(format!(
+        "    {:<29}{}",
+        "--instance <name>", "Mint this name for the launched instance (fails if taken)"
+    ));
 
     // Environment
     lines.push(String::new());
@@ -1314,6 +1318,20 @@ mod tests {
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
         assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
+    }
+
+    #[test]
+    fn launch_help_lists_instance_flag_but_resume_help_does_not() {
+        let omp_help = get_command_help("omp");
+        assert!(
+            omp_help.contains("--instance <name>"),
+            "hcom omp --help must list --instance"
+        );
+        let resume_help = get_command_help("r");
+        assert!(
+            !resume_help.contains("--instance"),
+            "hcom r --help must not list --instance: the name is minted at launch only"
+        );
     }
 
     #[test]
