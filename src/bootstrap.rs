@@ -62,11 +62,11 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
-  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
+  Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life|bundle|rpc_result | --status active|listening|blocked|inactive|launching|error | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
-  Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
+  Example: `hcom 1 claude --tag cool` -> Names: on stdout (or `hcom events launch`) -> send it a task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   each supports --help (set prompt, system, background, forward args, etc)
 - Run workflows: run <script> [args] [--help]
@@ -83,7 +83,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
 4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
-Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
+Agent names are 1-24 chars: start with a lowercase letter, then lowercase letters, digits, or `_`. No dashes. A spawn without a chosen name still mints a 4-letter CVCV word. When the user mentions a name, run `hcom list` before treating it as an agent — it may not be one.
 {active_instances}
 
 This is session context, not a task for immediate action."#;
@@ -793,6 +793,19 @@ mod tests {
         assert!(result.contains("SUBAGENTS")); // Claude-specific section
         assert!(result.contains("Messages instantly and automatically arrive")); // Auto delivery
         assert!(!result.contains("Headless mode")); // Not headless
+        assert!(
+            result.contains("start with a lowercase letter"),
+            "UNIVERSAL must teach chosen-name grammar, not 4-letter-only"
+        );
+        assert!(
+            result.contains("run `hcom list`"),
+            "UNIVERSAL must tell the agent to check the roster, not assume a mention is an agent"
+        );
+        assert_eq!(
+            result.contains("Agent names are 4-letter CVCV words"),
+            false,
+            "UNIVERSAL must not claim names are only 4-letter CVCV words"
+        );
         assert!(result.contains("</hcom_system_context>"));
     }
 
@@ -967,6 +980,108 @@ mod tests {
             assert!(result.contains("send @name(s)"));
             assert!(result.contains("send @luna @nova"));
             assert!(result.contains("send @team- -- msg"));
+        }
+    }
+
+    /// The primer's filter summary is injected into every spawned agent, so
+    /// every `|`-enumerated value list on that line must name exactly the set
+    /// the parser accepts. The accepted set is read off the parser — clap's own
+    /// `possible values:` rejection for a bogus value — never restated here.
+    ///
+    /// Every enumerated pair is checked, not one: the earlier `--type`-only
+    /// guard (hcom-i9k) let a stale `--status` list sit beside the fixed row.
+    ///
+    /// Pairs whose flag takes a free-form value (a NAME/PATTERN/PATH the parser
+    /// accepts verbatim) have no parser-side value set to compare against. They
+    /// are skipped explicitly and named in the failure message rather than
+    /// silently ignored.
+    ///
+    /// The coverage floor names the pairs the primer is expected to carry, the
+    /// way the FILTER_HELP sibling does: which pairs the summary line includes
+    /// cannot be derived from the line itself, so deletion of a whole pair has
+    /// to be caught by saying so.
+    #[test]
+    fn test_universal_primer_enumerations_match_parser_possible_values() {
+        let (tmp, db) = setup_test_db();
+        let primer = get_bootstrap(
+            &db,
+            tmp.path(),
+            "nova",
+            "codex",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+
+        let filter_line = primer
+            .lines()
+            .find(|line| line.contains("Filters (same flag=OR"))
+            .expect("primer must carry the shared filter summary line");
+        let pairs = filter_line
+            .split_once("): ")
+            .expect("the filter summary line has a header before its first pair")
+            .1;
+
+        let mut checked: Vec<&str> = Vec::new();
+        let mut skipped: Vec<&str> = Vec::new();
+
+        for segment in pairs.split(" | ") {
+            let mut tokens = segment.split_whitespace();
+            let flag = tokens
+                .next()
+                .unwrap_or_else(|| panic!("empty filter pair in {filter_line:?}"));
+            assert!(
+                flag.starts_with("--"),
+                "filter pair {segment:?} on {filter_line:?} does not start with a flag"
+            );
+            let advertised = tokens.next().unwrap_or_default();
+
+            // Ask the parser what this flag accepts; `None` is a free-form
+            // flag (NAME/PATTERN/PATH), which has no value set to compare.
+            let Some(from_parser) = crate::commands::help::parser_accepted_values(flag) else {
+                // Nothing below compares a free-form pair, so its skip-list
+                // entry is the only trace it leaves: `--agent NAME` could lose
+                // its NAME and the pair would still be recorded as present.
+                assert!(
+                    !advertised.is_empty(),
+                    "free-form filter pair {segment:?} on {filter_line:?} advertises no value"
+                );
+                skipped.push(flag);
+                continue;
+            };
+
+            let mut from_primer: Vec<&str> = advertised.split('|').collect();
+            let mut from_parser: Vec<&str> = from_parser.iter().map(String::as_str).collect();
+            from_primer.sort_unstable();
+            from_parser.sort_unstable();
+            assert_eq!(
+                from_primer, from_parser,
+                "{flag} advertises a stale set in the primer\n\
+                 pair: {segment}\n\
+                 (free-form pairs skipped before this one: {skipped:?})"
+            );
+            checked.push(flag);
+        }
+
+        // The floor must name the pairs, not just assert that some pair was
+        // checked: `!checked.is_empty()` passed while the whole `--status` pair
+        // was deleted from the line, because `--type` kept the set non-empty.
+        for flag in ["--type", "--status"] {
+            assert!(
+                checked.contains(&flag),
+                "the primer no longer enumerates {flag}'s accepted values: {filter_line:?}"
+            );
+        }
+        // The free-form pairs are skipped, never compared, so their presence is
+        // only visible in the skip list.
+        for flag in ["--agent", "--cmd", "--file"] {
+            assert!(
+                skipped.contains(&flag),
+                "the primer no longer carries the free-form {flag} pair: {filter_line:?}"
+            );
         }
     }
 

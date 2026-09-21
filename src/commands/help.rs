@@ -10,9 +10,18 @@ type HelpEntry = (&'static str, &'static str);
 // ── Shared filter help (events, listen, events sub) ─────────────────────
 
 const FILTER_HELP: &[HelpEntry] = &[
-    ("  --agent NAME", "Agent name"),
-    ("  --type TYPE", "message | status | life"),
-    ("  --status VAL", "listening | active | blocked"),
+    (
+        "  --agent NAME",
+        "Rows emitted by that instance (not mail addressed to it \u{2014} use --mention)",
+    ),
+    (
+        "  --type TYPE",
+        "message | status | life | bundle | rpc_result",
+    ),
+    (
+        "  --status VAL",
+        "active | listening | blocked | inactive | launching | error",
+    ),
     (
         "  --context PATTERN",
         "tool:Bash | deliver:X (supports * wildcard)",
@@ -31,7 +40,10 @@ const FILTER_HELP: &[HelpEntry] = &[
     ),
     ("  --collision", "Two agents edit same file within 30s"),
     ("  --from NAME", "Sender"),
-    ("  --mention NAME", "@mention target"),
+    (
+        "  --mention NAME",
+        "Mail addressed to NAME (@mention target)",
+    ),
     ("  --intent VAL", "request | inform | ack"),
     ("  --thread NAME", "Thread name"),
     ("  --after TIME", "After timestamp (ISO-8601)"),
@@ -50,6 +62,10 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("  events", "Last 20 events as JSON"),
     ("  --last N", "Limit count (default: 20)"),
     ("  --all", "Include archived sessions"),
+    (
+        "  --full",
+        "Full-fidelity rows: keep delivered_to/sender_kind/scope/mentions + microsecond ts",
+    ),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
@@ -117,7 +133,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ("  status_*", "val, context, detail"),
     ("  life_*", "action, by, batch_id, reason"),
     ("", ""),
-    ("  type", "message, status, life"),
+    ("  type", "message, status, life, bundle, rpc_result"),
     ("  msg_scope", "broadcast, mentions"),
     ("  msg_sender_kind", "instance, external, system"),
     (
@@ -235,20 +251,30 @@ const SEND_HELP: &[HelpEntry] = &[
         "  broadcast + --thread reuses prior thread members; seed with @mentions first",
     ),
     (
-        "  --delivery <lane>",
-        "Delivery lane: auto | steer | queue (default auto)",
+        "  --delivery steer|queue",
+        "Lane (default queue: never interrupts a live turn)",
+    ),
+    (
+        "",
+        "queue is the default; at an idle recipient both lanes are delivered and start a turn, while against a turn in flight queue waits for that turn's boundary and steer interrupts it — steer must be asked for explicitly.",
     ),
     ("", ""),
     ("Sender:", ""),
-    ("  --from <name>", "External sender identity (alias: -b)"),
-    ("  --name <name>", "Your identity (agent name or UUID)"),
     (
-        "  --as-instance",
-        "Send as your own bound instance identity (fails if unbound)",
+        "  --as-overseer",
+        "Send as the human overseer (alias: -b). Required when the caller is not a bound agent.",
     ),
     (
         "  --as-system <source-id>",
         "System sender identity (requires @targets, never broadcasts)",
+    ),
+    (
+        "  --from <name>",
+        "Named external sender (scripts). Prefer --as-system or --as-overseer.",
+    ),
+    (
+        "  --as-instance",
+        "Optional: same as the default when your session is bound (fails if unbound)",
     ),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
@@ -265,6 +291,14 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     ("  --extends <id>", "Parent bundle (optional)"),
     ("", "See 'hcom bundle --help' for bundle details"),
+    ("", ""),
+    ("Output:", ""),
+    (
+        "  --json",
+        "Print a persist-time receipt (event_id, accepted_at, delivered_to, delivery, from); \
+         delivered_to lists the instances the row was addressed to (routing, not consumption), \
+         and is an empty list when every target is virtual or unregistered",
+    ),
     ("", ""),
     ("Examples:", ""),
     ("  hcom send @luna -- Hello there!", ""),
@@ -399,6 +433,23 @@ const DISCARD_HELP: &[HelpEntry] = &[
         "",
         "Frees the name for reuse; refused once the identity committed work.",
     ),
+];
+
+const RENAME_HELP: &[HelpEntry] = &[
+    ("rename <old> <new>", "Rename an instance (rewrites live bindings)"),
+    ("  --json", "Machine-readable output"),
+    ("", ""),
+    ("", "Refused while the process is alive; stop/recycle it first."),
+    ("", "Former name stays reserved and resolves to the new name."),
+];
+
+const DELETE_HELP: &[HelpEntry] = &[
+    ("delete <name>", "Delete a committed identity and free its name"),
+    ("  --json", "Machine-readable output"),
+    ("  --go", "Confirm when run inside an AI tool"),
+    ("", ""),
+    ("", "Refused while the process is alive; stop it first."),
+    ("", "History keeps the name; former-name aliases go dead."),
 ];
 
 const START_HELP: &[HelpEntry] = &[
@@ -745,7 +796,8 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
     ));
     lines.push(format!(
         "    {:<29}{}",
-        "--instance <name>", "Mint this name for the launched instance (fails if taken)"
+        "--instance <name>",
+        "Mint this name for the launched instance (1-24 chars: start lowercase letter, then lowercase/digits/_; fails if taken)"
     ));
 
     // Environment
@@ -829,6 +881,12 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
 
 // ── Format a single help entry ──────────────────────────────────────────
 
+/// Width of the padded usage column in an indented (`  `-prefixed) help row.
+///
+/// Guards that slice a rendered row's description derive their column from this
+/// rather than restating the number, so a change here moves the guards with it.
+const USAGE_COL_WIDTH: usize = 32;
+
 fn format_entry(usage: &str, desc: &str) -> String {
     if usage.is_empty() {
         // Empty usage: plain text or blank line
@@ -839,7 +897,7 @@ fn format_entry(usage: &str, desc: &str) -> String {
         }
     } else if usage.starts_with("  ") {
         // Indented: option/setting line
-        format!("  {:<32} {}", usage, desc)
+        format!("  {:<width$} {}", usage, desc, width = USAGE_COL_WIDTH)
     } else if usage.ends_with(':') {
         // Section header
         if desc.is_empty() {
@@ -856,6 +914,45 @@ fn format_entry(usage: &str, desc: &str) -> String {
 /// Format entries from a static slice.
 fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
     entries.iter().map(|(u, d)| format_entry(u, d)).collect()
+}
+
+/// The shared filter rows exactly as the `events`/`listen`/`events sub` help
+/// renders them.
+///
+/// `hcom events sub` with no filters prints these same rows; consuming them from
+/// here instead of re-literalizing them is what keeps the two reachable surfaces
+/// from drifting apart.
+pub(crate) fn filter_help_rows() -> Vec<String> {
+    format_entries(FILTER_HELP)
+}
+
+/// The values a filter flag accepts, read off clap's own rejection of a bogus
+/// value (`[possible values: ...]`).
+///
+/// `None` means the parser exposes no closed set for that flag: a free-form
+/// NAME/PATTERN/PATH argument, a flag clap does not know, or one carrying its
+/// own validator (`--after`/`--before`).
+///
+/// Doc surfaces that enumerate a flag's accepted values (the primer's filter
+/// summary, [`FILTER_HELP`]) are guarded against this, so those guards never
+/// restate a value list that could itself go stale.
+#[cfg(test)]
+pub(crate) fn parser_accepted_values(flag: &str) -> Option<Vec<String>> {
+    use clap::Parser;
+
+    let err =
+        crate::commands::events::EventsArgs::try_parse_from(["events", flag, "no-such-value"])
+            .err()?
+            .to_string();
+    let (_, accepted) = err.split_once("possible values: ")?;
+    Some(
+        accepted
+            .split(']')
+            .next()?
+            .split(',')
+            .map(|v| v.trim().to_string())
+            .collect(),
+    )
 }
 
 // ── Lookup and render ───────────────────────────────────────────────────
@@ -879,6 +976,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "bundle",
     "kill",
     "discard",
+    "rename",
+    "delete",
     "term",
     "relay",
     "run",
@@ -952,6 +1051,8 @@ Commands:\n\
   start        Connect to hcom (run inside any AI tool)\n\
   stop         Disconnect from hcom\n\
   discard      Discard a never-committed provisional identity\n\
+  rename       Rename an instance (former name stays reserved)\n\
+  delete       Delete a committed identity (frees the name)\n\
   config       Get/set global and per-agent settings\n\
   run          Execute workflow scripts\n\
   relay        Cross-device sync + relay daemon\n\
@@ -1010,7 +1111,7 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
          \x20 {usage_line}\n\
          \n\
          <target> can be:\n\
-         \x20 <name>                            hcom name (4-letter)\n\
+         \x20 <name>                            hcom instance name\n\
          \x20 <uuid>                            claude/codex/gemini session UUID\n\
          \x20 ses_<id>                          opencode/kilo session ID\n\
          \x20 <thread-name>                     claude /rename title or codex thread_name\n\
@@ -1022,6 +1123,8 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
          {flags}\n\
          \n\
          Extra args after flags are forwarded to the underlying tool.\n\
+         An absolute path whose basename is ompalt is exec'd as the\n\
+         tool binary (not forwarded, not persisted into launch_args).\n\
          \n\
          See also:\n\
          \x20 {see_also_line}",
@@ -1075,6 +1178,8 @@ pub fn get_command_help(name: &str) -> String {
         "bundle" => Some(BUNDLE_HELP),
         "stop" => Some(STOP_HELP),
         "discard" => Some(DISCARD_HELP),
+        "rename" => Some(RENAME_HELP),
+        "delete" => Some(DELETE_HELP),
         "start" => Some(START_HELP),
         "kill" => Some(KILL_HELP),
         "listen" => Some(LISTEN_HELP),
@@ -1173,6 +1278,172 @@ pub fn print_help() {
 mod tests {
     use super::*;
 
+    /// FILTER_HELP is the shared row set behind `events --help`, `listen` help
+    /// and `events sub` help, so a stale value list here ships on three
+    /// surfaces at once. Its enumerated rows are compared against the parser's
+    /// own accepted set ([`parser_accepted_values`]) — a stale `--status` row
+    /// (`listening | active | blocked`) lived here while the parser accepted
+    /// six values.
+    ///
+    /// Rows whose description merely contains a pipe (`--context`'s
+    /// `tool:Bash | deliver:X`) or is prose are not value lists and are
+    /// skipped; the coverage floor below keeps that skip list from swallowing
+    /// the rows this guard exists for.
+    #[test]
+    fn filter_help_enumerations_match_parser_possible_values() {
+        // `format_entry` renders an indented row as `  ` + a USAGE_COL_WIDTH-wide
+        // usage column + ` ` + the description, so the description starts here.
+        const DESC_COL: usize = 2 + USAGE_COL_WIDTH + 1;
+
+        let rows = filter_help_rows();
+        let mut checked: Vec<&str> = Vec::new();
+        for row in &rows {
+            let flag = row
+                .split_whitespace()
+                .next()
+                .expect("a filter row starts with a flag");
+            assert!(
+                flag.starts_with("--"),
+                "FILTER_HELP is a flag registry, but this row does not start with one: {row:?}"
+            );
+            // Slicing at DESC_COL reaches the description only while the usage
+            // fits the column: a longer usage pushes it right and the row would
+            // be skipped in silence rather than compared. The boundary has to be
+            // where the column claims it is, and an overflowing usage leaves it
+            // mid-word.
+            assert!(
+                row.get(..DESC_COL).unwrap_or_default().ends_with(' '),
+                "FILTER_HELP row's usage column is wider than {USAGE_COL_WIDTH} chars, \
+                 so its description cannot be compared: {row:?}"
+            );
+            let desc = row.get(DESC_COL..).unwrap_or_default();
+            // An enumerated row is exactly `a | b | c` of bare identifiers.
+            let cells: Vec<&str> = desc.split(" | ").collect();
+            if cells.len() < 2 || !cells.iter().all(|c| is_bare_identifier(c)) {
+                continue;
+            }
+
+            let Some(from_parser) = parser_accepted_values(flag) else {
+                panic!("{flag} enumerates values in FILTER_HELP but the parser exposes no set")
+            };
+            let mut advertised: Vec<&str> = cells;
+            let mut accepted: Vec<&str> = from_parser.iter().map(String::as_str).collect();
+            advertised.sort_unstable();
+            accepted.sort_unstable();
+            assert_eq!(
+                advertised, accepted,
+                "{flag} advertises a stale set in FILTER_HELP: {row}"
+            );
+            checked.push(flag);
+        }
+
+        for flag in ["--type", "--status", "--action", "--intent"] {
+            assert!(
+                checked.contains(&flag),
+                "FILTER_HELP must still enumerate {flag}'s accepted values: {rows:?}"
+            );
+        }
+    }
+
+    /// `events --help`'s SQL-reference tail ([`EVENTS_HELP_2`]) restates closed
+    /// filter value sets as comma-separated columns — its `type` row duplicates
+    /// `--type`'s accepted set. It is a second surface for the drift class the
+    /// FILTER_HELP guard covers, scanned by neither guard before this one
+    /// existed.
+    ///
+    /// A row is compared when its usage is a bare lowercase column name and
+    /// every comma-separated cell of its description is a bare identifier.
+    /// Rows outside that are skipped and named in the failure messages instead:
+    /// the `Base`/`status_*`/`life_*` field inventories (values under a usage
+    /// that is not a column), `msg_scope`/`msg_sender_kind` (no filter flag
+    /// carries their set), and `status_context` (its cells are illustrative
+    /// `tool:X` patterns, not bare values). `msg_*` is not named, because its
+    /// cells carry `[]` (`delivered_to[]`, `mentions[]`) and so it never reads
+    /// as an enumerated row in the first place. The coverage floor below keeps
+    /// that skip list from swallowing the rows this guard exists for.
+    ///
+    /// The values are read off the entries rather than sliced out of the
+    /// rendered rows: `format_entry` copies a description verbatim, and a usage
+    /// wider than the padded column would push a render slice past the values
+    /// and skip the row in silence (one row here is already 33 chars wide).
+    #[test]
+    fn events_help_2_enumerations_match_parser_possible_values() {
+        let rows = format_entries(EVENTS_HELP_2);
+        let mut checked: Vec<&str> = Vec::new();
+        let mut skipped: Vec<(&str, &str)> = Vec::new();
+        for ((usage, desc), row) in EVENTS_HELP_2.iter().zip(&rows) {
+            let column = usage.trim();
+            let cells: Vec<&str> = desc.split(", ").collect();
+            let enumerates = cells.len() >= 2 && cells.iter().all(|c| is_bare_identifier(c));
+            if !is_bare_identifier(column) {
+                // Section headers, `--flag` rows and `events sub ...` command
+                // lines are not SQL-reference columns. Only a usage that still
+                // claims values — the `Base`/`status_*`/`life_*` field
+                // inventories — is worth naming as a skip.
+                if enumerates {
+                    skipped.push((
+                        column,
+                        "values under a usage that is not a bare column name",
+                    ));
+                }
+                continue;
+            }
+            if !enumerates {
+                skipped.push((column, "no comma-separated list of bare values"));
+                continue;
+            }
+
+            let Some((flag, from_parser)) = sql_reference_flag(column) else {
+                skipped.push((column, "no filter flag with a closed value set"));
+                continue;
+            };
+            let mut advertised: Vec<&str> = cells;
+            let mut accepted: Vec<&str> = from_parser.iter().map(String::as_str).collect();
+            advertised.sort_unstable();
+            accepted.sort_unstable();
+            assert_eq!(
+                advertised, accepted,
+                "{column} restates a stale set in the events SQL reference\n\
+                 row: {row}\n\
+                 (mapped to {flag}; rows not compared before this one: {skipped:?})"
+            );
+            checked.push(column);
+        }
+
+        // Naming the rows, not just asserting that some row was compared: the
+        // columns the parser exposes a closed set for must keep being compared,
+        // whether a value goes stale or a whole row is de-enumerated.
+        for column in ["type", "life_action"] {
+            assert!(
+                checked.contains(&column),
+                "the events SQL reference must still restate {column}'s accepted values: {rows:?}"
+            );
+        }
+    }
+
+    /// A bare enum value as the help text writes it: lowercase ASCII letters and
+    /// underscores, nothing else.
+    fn is_bare_identifier(cell: &str) -> bool {
+        !cell.is_empty() && cell.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')
+    }
+
+    /// The filter flag whose accepted set a SQL-reference column restates, with
+    /// that set.
+    ///
+    /// The `events_v` view names columns `msg_*`/`status_*`/`life_*`, and the
+    /// value a column carries is named by its last `_`-separated segment
+    /// (`life_action` -> `--action`). A candidate counts only when the parser
+    /// exposes a closed set for it, so a column with no flag counterpart
+    /// (`msg_scope`, `msg_sender_kind`) resolves to `None` and is skipped by
+    /// name rather than compared against nothing.
+    fn sql_reference_flag(column: &str) -> Option<(String, Vec<String>)> {
+        let tail = column.rsplit('_').next().unwrap_or(column);
+        [column, tail]
+            .into_iter()
+            .map(|name| format!("--{}", name.replace('_', "-")))
+            .find_map(|flag| parser_accepted_values(&flag).map(|values| (flag, values)))
+    }
+
     #[test]
     fn help_text_contains_version() {
         // Capture what print_help would output by checking the format string
@@ -1188,6 +1459,8 @@ mod tests {
             "events",
             "stop",
             "discard",
+            "rename",
+            "delete",
             "start",
             "listen",
             "status",
@@ -1298,6 +1571,10 @@ mod tests {
             resume_help.contains("--run-here"),
             "hcom r --help must list --run-here; hiding it makes in-pane resume undiscoverable"
         );
+        assert!(
+            resume_help.contains("ompalt"),
+            "hcom r --help must say an absolute ompalt is the tool binary"
+        );
         let omp_help = get_command_help("omp");
         assert!(
             omp_help.contains("--run-here"),
@@ -1308,11 +1585,8 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(
-            help.contains(
-                "claude|gemini|codex|opencode|kilo|pi|omp|antigravity|cursor|kimi|copilot"
-            )
-        );
+        assert!(help
+            .contains("claude|gemini|codex|opencode|kilo|pi|omp|antigravity|cursor|kimi|copilot"));
         assert!(help.contains(
             "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/omp)"
         ));
@@ -1335,11 +1609,108 @@ mod tests {
     }
 
     #[test]
+    fn launch_help_instance_flag_states_grammar() {
+        let omp_help = get_command_help("omp");
+        assert!(
+            omp_help.contains("--instance <name>"),
+            "hcom omp --help must list --instance"
+        );
+        assert!(
+            omp_help.contains("1-24"),
+            "--instance help must state the frozen name grammar"
+        );
+        assert_eq!(
+            omp_help.contains("hcom name (4-letter)"),
+            false,
+            "omp help must not claim names are 4-letter"
+        );
+        // SHARED_LAUNCH_FLAGS stays charset-free: resume/fork never mint names.
+        let resume_help = get_command_help("r");
+        assert!(
+            resume_help.contains("--instance") == false,
+            "hcom r --help must not list --instance"
+        );
+        assert_eq!(
+            resume_help.contains("hcom name (4-letter)"),
+            false,
+            "resume help must not claim names are 4-letter"
+        );
+        assert!(
+            resume_help.contains("hcom instance name"),
+            "resume help names the instance without a 4-letter lock"
+        );
+    }
+
+    #[test]
     fn send_help_lists_as_system() {
         let help = get_command_help("send");
         assert!(
             help.contains("--as-system <source-id>"),
             "send help should list --as-system"
+        );
+        assert!(
+            help.contains("--as-overseer"),
+            "send help should list --as-overseer"
+        );
+        assert_eq!(
+            help.contains("hcom name (4-letter)"),
+            false,
+            "help must not claim names are 4-letter"
+        );
+    }
+
+    #[test]
+    fn send_help_names_both_lanes_and_the_json_receipt() {
+        let help = get_command_help("send");
+        assert!(
+            help.contains("steer|queue"),
+            "send help must name the two delivery lanes, not a default-implied one: {help}"
+        );
+        assert!(
+            help.contains("--json"),
+            "send help must list the persist-time receipt flag: {help}"
+        );
+        assert!(
+            !help.contains("auto"),
+            "the retired auto lane must not appear in send help: {help}"
+        );
+    }
+
+    /// `hcom events --help` is the documented filter surface: it must document
+    /// the `--full` fidelity escape hatch, and not let a reader mistake
+    /// `--agent` for "mail addressed to NAME". The `--type` row's accepted set
+    /// is guarded against the parser by
+    /// `filter_help_enumerations_match_parser_possible_values` (set equality in
+    /// both directions), so it is not restated here.
+    #[test]
+    fn events_help_documents_type_set_full_and_agent_vs_mention() {
+        let help = get_command_help("events");
+        let row = |flag: &str| {
+            help.lines()
+                .find(|l| l.trim_start().starts_with(flag))
+                .unwrap_or_else(|| panic!("events help has no {flag} row:\n{help}"))
+                .to_string()
+        };
+
+        let full_row = row("--full");
+        assert!(
+            full_row.len() > "--full".len() + 2,
+            "--full row must describe the flag, not just name it: {full_row}"
+        );
+
+        let agent_row = row("--agent NAME");
+        assert!(
+            agent_row.contains("emitted by"),
+            "--agent row must say it selects rows emitted by the instance: {agent_row}"
+        );
+        assert!(
+            agent_row.contains("--mention"),
+            "--agent row must point at --mention for mail addressed to a name: {agent_row}"
+        );
+        let mention_row = row("--mention NAME");
+        assert!(
+            mention_row.contains("addressed to"),
+            "--mention row must say it selects mail addressed to a name: {mention_row}"
         );
     }
 }

@@ -11,7 +11,7 @@ use crate::messages::{
     validate_intent, validate_message,
 };
 use crate::shared::{
-    CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
+    CommandContext, SENDER, SENDER_FORMER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
 };
 
 const SEND_AFTER_HELP: &str = "\
@@ -92,20 +92,29 @@ pub struct SendArgs {
     #[arg(long)]
     pub thread: Option<String>,
 
-    /// Delivery lane (auto|steer|queue)
-    #[arg(long, value_parser = ["auto", "steer", "queue"])]
+    /// Delivery lane (steer|queue); omitted means queue
+    #[arg(long, value_parser = ["steer", "queue"])]
     pub delivery: Option<String>,
+
+    /// Emit a machine-readable persist-time receipt instead of human output
+    #[arg(long)]
+    pub json: bool,
 
     // ── Sender ──
     /// External sender identity
     #[arg(long)]
     pub from: Option<String>,
 
-    /// Shorthand for --from bigboss
-    #[arg(short = 'b')]
+    /// Shorthand for --as-overseer (legacy -b)
+    #[arg(short = 'b', long = "bigboss")]
     pub bigboss: bool,
 
-    /// Send as your own bound instance identity (fails if unbound)
+    /// Send as the human overseer (required when the caller is not a bound agent)
+    #[arg(long = "as-overseer")]
+    pub as_overseer: bool,
+
+    /// Send as your own bound instance identity (fails if unbound).
+    /// Optional: the default send path is already bound-identity when no sender flag is set.
     #[arg(long = "as-instance")]
     pub as_instance: bool,
 
@@ -149,12 +158,13 @@ pub struct SendArgs {
 }
 
 impl SendArgs {
-    /// Resolve the effective --from name (--from overrides -b).
+    /// Resolve the effective external sender name.
+    /// `--from` overrides `-b` / `--as-overseer`. Former token `bigboss` canonicalizes to overseer.
     fn sender_name(&self) -> Option<String> {
         if let Some(ref name) = self.from {
-            Some(name.clone())
-        } else if self.bigboss {
-            Some("bigboss".to_string())
+            Some(canonicalize_operator_name(name))
+        } else if self.bigboss || self.as_overseer {
+            Some(SENDER.to_string())
         } else {
             None
         }
@@ -288,10 +298,11 @@ fn resolve_delivery(
     // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
     // Adhoc instances use inactive:tool:* between commands — still @mentionable.
     let rows = deliverable_instances(db)?;
+    let aliases = db.alias_map().unwrap_or_default();
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets)?;
+    let scope_result = compute_scope(message, &rows, explicit_targets, &aliases)?;
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -384,16 +395,35 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
     println!("  hcom send --go ...\n");
 }
 
+/// Persist-time receipt for one accepted send.
+///
+/// Returned when the `events` row is committed. It does NOT mean the message was
+/// injected into the recipient's turn: a `queue`-lane message waits for the
+/// recipient's turn boundary when a turn is in flight, and for the recipient to
+/// run at all when it is not. Only an idle lane-aware recipient picks the row up
+/// promptly, at its next poll.
+#[derive(Debug, Clone)]
+pub struct SendReceipt {
+    pub event_id: i64,
+    /// The row's own `events.timestamp`, not a second clock read.
+    pub accepted_at: String,
+    pub delivered_to: Vec<String>,
+    /// The lane recorded on the row (steer|queue).
+    pub delivery: String,
+    /// Sender name recorded on the row.
+    pub from: String,
+}
+
 ///
 /// Validates message, computes scope, logs event, notifies all instances.
-/// Returns delivered_to list (base names).
-pub fn send_message(
+/// Returns a persist-time receipt (event id, own timestamp, addressees, lane, sender).
+pub fn send_message_with_receipt(
     db: &HcomDb,
     identity: &SenderIdentity,
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
-) -> Result<Vec<String>, String> {
+) -> Result<SendReceipt, String> {
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
@@ -460,9 +490,11 @@ pub fn send_message(
         SenderKind::Instance => identity.name.clone(),
     };
 
-    // Log event to DB
-    let _event_id = db
-        .log_event("message", &routing_instance, &data)
+    // Log event to DB. The timestamp is generated here so the receipt's
+    // accepted_at is the row's own timestamp rather than a second clock read.
+    let accepted_at = crate::db::chrono_now_iso();
+    let event_id = db
+        .log_event_with_ts("message", &routing_instance, &data, Some(&accepted_at))
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
 
     // Auto-create request-watch subscriptions for targeted requests
@@ -480,7 +512,7 @@ pub fn send_message(
             && delivery.effective_scope == MessageScope::Mentions
             && !delivery.is_thread_resolved
         {
-            create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
+            create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
@@ -490,7 +522,25 @@ pub fn send_message(
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivery.delivered_to)
+    Ok(SendReceipt {
+        event_id,
+        accepted_at,
+        delivered_to: delivery.delivered_to,
+        delivery: delivery_lane.as_str().to_string(),
+        from: identity.name.clone(),
+    })
+}
+
+/// Backwards-compatible wrapper: delivered_to only.
+pub fn send_message(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    send_message_with_receipt(db, identity, message, envelope, explicit_targets)
+        .map(|receipt| receipt.delivered_to)
 }
 
 /// Resolve reply_to to local event ID. Returns None if not found.
@@ -693,6 +743,30 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
+fn canonicalize_operator_name(name: &str) -> String {
+    if name.eq_ignore_ascii_case(SENDER) || name.eq_ignore_ascii_case(SENDER_FORMER) {
+        SENDER.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+pub(crate) fn unbound_send_error(hcom_cmd: &str) -> String {
+    [
+        "Cannot infer who is sending. No message sent.",
+        "If you are an agent, raise this to your overseer \u{2014} your session is not bound to an hcom identity.",
+        &format!("{hcom_cmd} send --as-overseer ... if you are the human overseer and not an agent."),
+    ]
+    .join("\n")
+}
+
+fn refuse_unbound_sender() {
+    eprintln!(
+        "Error: {}",
+        unbound_send_error(&crate::runtime_env::build_hcom_command())
+    );
+}
+
 /// Main entry point for `hcom send` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -714,7 +788,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     if args.as_system.is_some() && (from_name.is_some() || args.as_instance) {
-        eprintln!("Error: --as-system cannot be combined with --from/-b/--as-instance");
+        eprintln!("Error: --as-system cannot be combined with --from/-b/--as-overseer/--as-instance");
         return 1;
     }
 
@@ -733,7 +807,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     if args.as_instance && from_name.is_some() {
-        eprintln!("Error: --as-instance cannot be combined with --from/-b");
+        eprintln!("Error: --as-instance cannot be combined with --from/-b/--as-overseer");
         return 1;
     }
 
@@ -751,7 +825,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                         .is_some_and(|s| !s.is_empty())
                 {
                     eprintln!(
-                        "Error: Subagents cannot use --from/-b/--as-system (sender spoofing)"
+                        "Error: Subagents cannot use --from/-b/--as-overseer/--as-system (sender spoofing)"
                     );
                     return 1;
                 }
@@ -886,26 +960,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Resolve sender identity ──
-    let sender_identity = if args.as_instance {
-        let bound = ctx.and_then(|c| {
-            if c.identity_from_binding {
-                c.identity.as_ref()
-            } else {
-                None
-            }
-        });
-        match bound {
-            Some(id) if matches!(id.kind, SenderKind::Instance) && id.instance_data.is_some() => {
-                id.clone()
-            }
-            _ => {
-                eprintln!(
-                    "Error: --as-instance requires your own bound hcom identity. Run 'hcom start' first. No message sent."
-                );
-                return 1;
-            }
-        }
-    } else if let Some(source_id) = &args.as_system {
+    // Bound agent: inferred, no --as-instance required.
+    // Human: --as-overseer (or legacy -b). Scripts: --as-system / --from.
+    // Unbound with no sender flag: refuse. Never fall through to a self-asserted --name.
+    let sender_identity = if let Some(source_id) = &args.as_system {
         SenderIdentity {
             kind: SenderKind::System,
             name: source_id.clone(),
@@ -919,21 +977,20 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             instance_data: None,
             session_id: None,
         }
-    } else if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
-        id.clone()
-    } else if let Some(name) = explicit_name {
-        match identity::resolve_identity(db, Some(name), None, None, None, None, None) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return 1;
-            }
-        }
     } else {
-        match identity::resolve_identity(db, None, None, None, None, None, None) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("Error: {e}");
+        let bound = ctx.and_then(|c| {
+            if c.identity_from_binding {
+                c.identity.as_ref()
+            } else {
+                None
+            }
+        });
+        match bound {
+            Some(id) if matches!(id.kind, SenderKind::Instance) && id.instance_data.is_some() => {
+                id.clone()
+            }
+            _ => {
+                refuse_unbound_sender();
                 return 1;
             }
         }
@@ -1096,26 +1153,51 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     // ── Send message ──
     // The delivery lane rides on the envelope, so an explicitly requested
-    // non-auto lane must not be discarded when its optional siblings are empty.
+    // non-default lane must not be discarded when its optional siblings are empty.
     let has_envelope = envelope.intent.is_some()
         || envelope.reply_to.is_some()
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some()
-        || envelope.delivery != crate::messages::DeliveryLane::Auto;
+        || envelope.delivery != crate::messages::DeliveryLane::default();
 
-    let delivered_to = match send_message(
+    let receipt = match send_message_with_receipt(
         db,
         &sender_identity,
         &message,
         if has_envelope { Some(&envelope) } else { None },
         targets_to_pass,
     ) {
-        Ok(d) => d,
+        Ok(r) => r,
         Err(e) => {
+            // Errors stay human on stderr: a caller parsing stdout must never
+            // mistake a diagnostic for a receipt.
             eprintln!("Error: {e}");
             return 1;
         }
     };
+    let delivered_to = receipt.delivered_to.clone();
+
+    // ── Machine-readable receipt ──
+    // Persist-time only: the row is durable and addressed. Injection is the
+    // recipient client's business, and a `queue`-lane row waits for that actor's
+    // turn boundary — or for it to run at all — rather than being delivered by
+    // the write. Placed above the feedback block so --json suppresses the prose
+    // and the unread drain (which would advance the sender's own read cursor);
+    // --json also wins over --quiet.
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event_id": receipt.event_id,
+                "accepted_at": receipt.accepted_at,
+                "delivered_to": receipt.delivered_to,
+                "delivery": receipt.delivery,
+                "from": receipt.from,
+            })
+        );
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
 
     // ── Feedback ──
     if args.quiet {
@@ -1335,7 +1417,21 @@ mod tests {
     fn parse_bigboss_flag() {
         let args = SendArgs::try_parse_from(["send", "-b", "--", "hello"]).unwrap();
         assert!(args.bigboss);
-        assert_eq!(args.sender_name(), Some("bigboss".to_string()));
+        assert_eq!(args.sender_name(), Some(SENDER.to_string()));
+    }
+
+    #[test]
+    fn parse_as_overseer_flag() {
+        let args = SendArgs::try_parse_from(["send", "--as-overseer", "--", "hello"]).unwrap();
+        assert!(args.as_overseer);
+        assert_eq!(args.sender_name(), Some(SENDER.to_string()));
+    }
+
+    #[test]
+    fn parse_from_bigboss_canonicalizes_to_overseer() {
+        let args =
+            SendArgs::try_parse_from(["send", "--from", "bigboss", "--", "hello"]).unwrap();
+        assert_eq!(args.sender_name(), Some(SENDER.to_string()));
     }
 
     #[test]
@@ -1844,6 +1940,108 @@ mod tests {
     fn parse_delivery_invalid_rejected() {
         let result = SendArgs::try_parse_from(["send", "--delivery", "bogus", "@luna", "--", "hi"]);
         assert!(result.is_err());
+        // "auto" is retired from the public CLI, not aliased to a lane.
+        assert!(
+            SendArgs::try_parse_from(["send", "--delivery", "auto", "@luna", "--", "hi"]).is_err()
+        );
+    }
+
+    // ── --json receipt ──
+
+    #[test]
+    fn send_json_flag_parses() {
+        assert!(
+            SendArgs::try_parse_from(["send", "--json", "@luna", "--", "hi"]).is_ok(),
+            "--json must be an accepted send flag"
+        );
+        let args = SendArgs::try_parse_from(["send", "--json", "@luna", "--", "hi"]).unwrap();
+        assert!(args.json);
+        let plain = SendArgs::try_parse_from(["send", "@luna", "--", "hi"]).unwrap();
+        assert!(!plain.json);
+    }
+
+    #[test]
+    #[serial]
+    fn send_receipt_event_id_and_accepted_at_match_the_stored_row() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "cli".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let receipt =
+            send_message_with_receipt(&db, &sender, "hi", None, Some(&["nova".to_string()]))
+                .unwrap();
+
+        assert_eq!(receipt.delivered_to, vec!["nova".to_string()]);
+        assert!(receipt.event_id > 0);
+
+        let (id, ts): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT id, timestamp FROM events WHERE id = ?",
+                rusqlite::params![receipt.event_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, receipt.event_id);
+        // The receipt must quote the row's own timestamp, not a second now().
+        assert_eq!(ts, receipt.accepted_at);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_receipt_reply_to_round_trips_its_own_event_id() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "cli".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let first =
+            send_message_with_receipt(&db, &sender, "ping", None, Some(&["nova".to_string()]))
+                .unwrap();
+
+        // The receipt's event_id is the handle a sender threads a reply to.
+        let mut envelope = MessageEnvelope::default();
+        envelope.reply_to = Some(first.event_id.to_string());
+        let second = send_message_with_receipt(
+            &db,
+            &sender,
+            "pong",
+            Some(&envelope),
+            Some(&["nova".to_string()]),
+        )
+        .unwrap();
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE id = ?",
+                rusqlite::params![second.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(json["reply_to_local"], serde_json::json!(first.event_id));
+        cleanup_test_db(path);
     }
 
     // ── --as-instance ──
@@ -1957,6 +2155,95 @@ mod tests {
 
     #[test]
     #[serial]
+    fn default_send_uses_bound_identity_without_as_instance() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at)
+                 VALUES ('nova', 'sess-2', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let ctx = bound_luna_ctx(&db);
+        let mut args = SendArgs::try_parse_from(["send", "@nova", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 0);
+        let (from, kind): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.from'), json_extract(data, '$.sender_kind')
+                 FROM events WHERE type = 'message'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(from, "luna");
+        assert_eq!(kind, "instance");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn default_send_rejects_unbound_without_sender_flag() {
+        let (db, path, _env) = setup_test_db();
+        let ctx = CommandContext {
+            explicit_name: Some("luna".into()),
+            identity: None,
+            go: true,
+            identity_from_binding: false,
+        };
+        let mut args = SendArgs::try_parse_from(["send", "--", "hi"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "self-asserted --name must not become the sender");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn as_overseer_writes_external_overseer() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at)
+                 VALUES ('nova', 'sess-2', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+            identity_from_binding: false,
+        };
+        let mut args =
+            SendArgs::try_parse_from(["send", "--as-overseer", "@nova", "--", "from above"]).unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, Some(&ctx)), 0);
+        let (from, kind): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.from'), json_extract(data, '$.sender_kind')
+                 FROM events WHERE type = 'message'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(from, SENDER);
+        assert_eq!(kind, "external");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn as_instance_rejects_unbound() {
         let (db, path, _env) = setup_test_db();
         let ctx = CommandContext {
@@ -2012,7 +2299,7 @@ mod tests {
     }
 
     /// A plain send (no intent/thread/reply_to/bundle) must still carry an
-    /// explicitly requested non-auto lane — the lane rides on the envelope, so
+    /// explicitly requested non-default lane — the lane rides on the envelope, so
     /// the envelope must not be discarded just because its other fields are empty.
     #[test]
     #[serial]
@@ -2143,7 +2430,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn send_message_defaults_delivery_auto() {
+    fn send_message_defaults_delivery_queue() {
         let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
@@ -2166,7 +2453,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored, "auto");
+        assert_eq!(stored, "queue");
         cleanup_test_db(path);
     }
 

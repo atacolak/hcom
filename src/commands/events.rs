@@ -81,7 +81,7 @@ pub struct EventsSubArgs {
     #[arg(long = "on-hit")]
     pub on_hit: Option<String>,
     /// Create the sub as an external sender (same semantics as `hcom send --from`).
-    /// Use `-b` as shorthand for `--as bigboss`.
+    /// Use `-b` as shorthand for `--as-overseer`.
     #[arg(long = "as")]
     pub as_name: Option<String>,
     #[arg(short = 'b', long = "bigboss", default_value_t = false)]
@@ -422,6 +422,32 @@ fn events_sub_sql(
     0
 }
 
+/// Help printed by `hcom events sub` with no filters.
+///
+/// The filter rows are the shared `FILTER_HELP` rows the `events --help` surface
+/// renders, so the two reachable surfaces cannot drift apart.
+fn events_sub_help_text() -> String {
+    let filter_rows = crate::commands::help::filter_help_rows().join("\n");
+    format!(
+        "Event subscriptions: get notified via hcom message when a future event matches.\n\n\
+         Usage:\n\
+         \x20 events sub [filters] [--once]     Subscribe using filter flags\n\
+         \x20 events sub \"SQL WHERE\" [--once]   Subscribe using raw SQL\n\
+         \x20 events sub list                   List active subscriptions\n\
+         \x20 events unsub <id>                 Remove a subscription\n\
+         \x20   --once                          Auto-remove after first match\n\
+         \x20   --for <name>                    Subscribe on behalf of another agent\n\
+         \x20   --on-hit <TEXT>                 Attach message (sent from caller) when sub fires\n\n\
+         Filters (same flag repeated = OR, different flags = AND):\n\
+         {filter_rows}\n\
+         \x20 Shortcuts: --idle NAME, --blocked NAME\n\n\
+         Examples:\n\
+         \x20 events sub --idle peso            Notified when peso goes idle\n\
+         \x20 events sub --file '*.py' --once   One-shot: next .py file write\n\
+         \x20 events sub --collision            File edit conflict detection"
+    )
+}
+
 /// Handle `hcom events sub` subcommand.
 fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) -> i32 {
     let is_list = args.rest.first().map(|s| s.as_str()) == Some("list");
@@ -507,37 +533,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     // No filters and no SQL: show help
     if sql_parts.is_empty() {
-        println!(
-            "Event subscriptions: get notified via hcom message when a future event matches.\n\n\
-             Usage:\n\
-             \x20 events sub [filters] [--once]     Subscribe using filter flags\n\
-             \x20 events sub \"SQL WHERE\" [--once]   Subscribe using raw SQL\n\
-             \x20 events sub list                   List active subscriptions\n\
-             \x20 events unsub <id>                 Remove a subscription\n\
-             \x20   --once                          Auto-remove after first match\n\
-             \x20   --for <name>                    Subscribe on behalf of another agent\n\
-             \x20   --on-hit <TEXT>                 Attach message (sent from caller) when sub fires\n\n\
-             Filters (same flag repeated = OR, different flags = AND):\n\
-             \x20 --agent NAME                      Agent name\n\
-             \x20 --type TYPE                       message | status | life\n\
-             \x20 --status VAL                      listening | active | blocked\n\
-             \x20 --context PATTERN                 tool:Bash | deliver:X (supports * wildcard)\n\
-             \x20 --action VAL                      created | started | ready | stopped | batch_launched | launch_failed | launch_blocked\n\
-             \x20 --cmd PATTERN                     Shell command (contains, ^prefix, =exact)\n\
-             \x20 --file PATH                       File write (*.py for glob, file.py for contains)\n\
-             \x20 --collision                        Two agents edit same file within 30s\n\
-             \x20 --from NAME                       Sender\n\
-             \x20 --mention NAME                    @mention target\n\
-             \x20 --intent VAL                      request | inform | ack\n\
-             \x20 --thread NAME                     Thread name\n\
-             \x20 --after TIME                      After timestamp (ISO-8601)\n\
-             \x20 --before TIME                     Before timestamp (ISO-8601)\n\
-             \x20 Shortcuts: --idle NAME, --blocked NAME\n\n\
-             Examples:\n\
-             \x20 events sub --idle peso            Notified when peso goes idle\n\
-             \x20 events sub --file '*.py' --once   One-shot: next .py file write\n\
-             \x20 events sub --collision            File edit conflict detection"
-        );
+        println!("{}", events_sub_help_text());
         return 0;
     }
 
@@ -1238,6 +1234,64 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 mod tests {
     use super::*;
 
+    /// `hcom events sub` with no filters is a second reachable copy of the filter
+    /// surface (the first is `events --help`). Its rows must be the shared
+    /// FILTER_HELP rows verbatim: that block equality is the invariant, and it
+    /// is what catches a re-literalised or empty splice.
+    #[test]
+    fn test_events_sub_help_renders_shared_filter_rows() {
+        let help = events_sub_help_text();
+        let lines: Vec<&str> = help.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("Filters (same flag repeated = OR"))
+            .expect("events sub help must have a filters header")
+            + 1;
+        let end = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("Shortcuts:"))
+            .expect("events sub help must close its filter block with the shortcuts row");
+        let rendered: Vec<&str> = lines[start..end].to_vec();
+        let shared = crate::commands::help::filter_help_rows();
+
+        assert_eq!(
+            rendered,
+            shared.iter().map(String::as_str).collect::<Vec<_>>(),
+            "events sub filter rows must be the shared FILTER_HELP rows verbatim:\n{help}"
+        );
+        // Structural anti-vacuity: the equality above is also satisfied by two
+        // empty slices, so the rendered block must additionally be whole. Row
+        // count and flag names are structure, not wording — a benign reword of
+        // FILTER_HELP (its em dash becoming an en dash, say) must not fail this
+        // suite, while an empty or truncated splice still must.
+        assert_eq!(
+            rendered.len(),
+            14,
+            "the splice must carry every shared filter row:\n{help}"
+        );
+        for flag in [
+            "--agent",
+            "--type",
+            "--status",
+            "--context",
+            "--action",
+            "--cmd",
+            "--file",
+            "--collision",
+            "--from",
+            "--mention",
+            "--intent",
+            "--thread",
+            "--after",
+            "--before",
+        ] {
+            assert!(
+                rendered.iter().any(|l| l.trim_start().starts_with(flag)),
+                "the shared filter row {flag} is missing from the splice:\n{help}"
+            );
+        }
+    }
+
     #[test]
     fn test_streamline_event_message() {
         let event = json!({
@@ -1401,6 +1455,18 @@ mod tests {
         assert_eq!(args.filters.agent, vec!["peso"]);
         assert_eq!(args.filters.event_type, vec!["message"]);
         assert!(args.subcmd.is_none());
+    }
+
+    #[test]
+    fn test_events_args_type_accepts_every_written_event_type() {
+        use clap::Parser;
+        // bundle (bundles.rs log_event) and rpc_result (rpc path) are real rows
+        // in events_v, so --type must be able to express them.
+        for t in ["message", "status", "life", "bundle", "rpc_result"] {
+            let args = EventsArgs::try_parse_from(["events", "--type", t])
+                .unwrap_or_else(|e| panic!("--type {t} must parse: {e}"));
+            assert_eq!(args.filters.event_type, vec![t]);
+        }
     }
 
     #[test]

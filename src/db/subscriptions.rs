@@ -852,11 +852,12 @@ pub(crate) fn send_message_as(
         .collect();
 
     let parsed_mentions = extract_mentions(message);
+    let aliases = db.alias_map().unwrap_or_default();
     let scope_result = if parsed_mentions.is_empty() {
-        compute_scope(message, &instances, None).map_err(anyhow::Error::msg)?
+        compute_scope(message, &instances, None, &aliases).map_err(anyhow::Error::msg)?
     } else {
         let (mentions, _) =
-            resolve_targets(&parsed_mentions, &instances).map_err(anyhow::Error::msg)?;
+            resolve_targets(&parsed_mentions, &instances, &aliases).map_err(anyhow::Error::msg)?;
         ScopeResult {
             scope: MessageScope::Mentions,
             mentions,

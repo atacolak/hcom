@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, InputEvent } from "@oh-my-pi/pi-coding-agent";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
@@ -71,17 +71,20 @@ function hcom(args: string[]): Promise<HcomResult> {
 	});
 }
 
+/** The per-message text an injection embeds; also the persist-gate marker. */
+function messagePart(m: any, recipientName: string): string {
+	const prefix = m.intent
+		? m.thread
+			? `[${m.intent}:${m.thread} #${m.event_id}]`
+			: `[${m.intent} #${m.event_id}]`
+		: m.thread
+			? `[thread:${m.thread} #${m.event_id}]`
+			: `[new message #${m.event_id}]`;
+	return `${prefix} ${m.from} -> ${recipientName}: ${m.message}`;
+}
+
 function formatMessagesForInjection(messages: any[], recipientName: string): string {
-	const parts = messages.map((m: any) => {
-		const prefix = m.intent
-			? m.thread
-				? `[${m.intent}:${m.thread} #${m.event_id}]`
-				: `[${m.intent} #${m.event_id}]`
-			: m.thread
-				? `[thread:${m.thread} #${m.event_id}]`
-				: `[new message #${m.event_id}]`;
-		return `${prefix} ${m.from} -> ${recipientName}: ${m.message}`;
-	});
+	const parts = messages.map((m: any) => messagePart(m, recipientName));
 	if (messages.length === 1) return `<hcom>${parts[0]}</hcom>`;
 	return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")}</hcom>`;
 }
@@ -99,33 +102,35 @@ export type PendingMessage = {
 	thread?: string;
 	intent?: string;
 	delivery?: string;
+	/** Stored on the row (`[hcom-events]` notices carry `system`); today's
+	 * `omp-read` projection omits it, so `from` is the usual handle. */
+	sender_kind?: string;
 };
 
-export type DeliveryLane = "auto" | "steer" | "queue";
+export type DeliveryLane = "steer" | "queue";
 
 /** Lane urgency; a batch resolves to its most urgent lane. */
-const LANE_RANK: Record<DeliveryLane, number> = { queue: 1, auto: 2, steer: 3 };
+const LANE_RANK: Record<DeliveryLane, number> = { queue: 1, steer: 2 };
 
 /** `"hold"` = inject nothing and ack nothing. Otherwise the exact `sendUserMessage` options. */
 export type InjectionPlan = "hold" | { deliverAs?: "steer" | "followUp" };
 
 function laneOf(message: PendingMessage): DeliveryLane {
-	// Absent (legacy row) or unknown lane degrades to "auto".
-	if (message.delivery === "steer" || message.delivery === "queue") return message.delivery;
-	return "auto";
+	// Absent (legacy row), the retired "auto" value, and anything unknown all
+	// degrade to "queue": the sender must ask for a steer explicitly.
+	return message.delivery === "steer" ? "steer" : "queue";
 }
 
 /**
  * Lane-aware plan for one unread batch.
  *
- * - `queue` at an idle session is HELD: injecting it would start a turn the
- *   sender did not ask for. It is delivered by the next trigger that finds a
- *   turn already in flight (or a bodyless wake carrying it).
- * - At idle a non-held batch is injected with NO `deliverAs`, so
- *   `sendUserMessage` takes the `prompt()` path and starts the consuming turn
- *   synchronously.
- * - With a turn in flight, `steer` — and any demanding `auto` batch — interrupts
- *   it; non-demanding `auto` and `queue` wait for the turn to end.
+ * At an idle session there is no turn to wait for, so BOTH lanes are delivered
+ * with NO `deliverAs`: `sendUserMessage` takes the `prompt()` path and starts
+ * the consuming turn synchronously. Holding `queue` there would deadlock on the
+ * very mail that must start that turn.
+ * - The lanes differ ONLY while a turn is in flight: `steer` interrupts it,
+ *   `queue` waits for the boundary. Intent never promotes a lane — a steer is
+ *   never inferred from a demanding message arriving at a busy actor.
  */
 export function decideInjection(messages: PendingMessage[], isIdle: boolean): InjectionPlan {
 	if (messages.length === 0) return "hold";
@@ -134,10 +139,62 @@ export function decideInjection(messages: PendingMessage[], isIdle: boolean): In
 		const candidate = laneOf(message);
 		if (LANE_RANK[candidate] > LANE_RANK[lane]) lane = candidate;
 	}
-	if (isIdle) return lane === "queue" ? "hold" : {};
-	// Absent intent is demanding; only an explicit `inform`/`ack` is not.
-	const demanding = messages.some((message) => message.intent !== "inform" && message.intent !== "ack");
-	return lane === "steer" || (lane === "auto" && demanding) ? { deliverAs: "steer" } : { deliverAs: "followUp" };
+	if (isIdle) return {};
+	return lane === "steer" ? { deliverAs: "steer" } : { deliverAs: "followUp" };
+}
+
+/** Event ids a notice names as `#<id>`; the CLI renders the event it reports that way. */
+function referencedEventIds(text: string): number[] {
+	const ids: number[] = [];
+	for (const match of text.matchAll(/#(\d+)/g)) {
+		const id = Number(match[1]);
+		if (Number.isInteger(id) && id > 0) ids.push(id);
+	}
+	return ids;
+}
+
+/**
+ * Whether this row is the events-sub notice for an event the same fetch already
+ * carries: a `sys_[hcom-events]` row quoting `#<id>` of a row next to it.
+ *
+ * The notice is real mail (`send_sub_notification` writes it milliseconds after
+ * the event it reports), so an unfiltered batch hands the recipient its own
+ * subscription echo as peer mail (midi #57749). A notice naming an event the
+ * fetch does not carry is the only copy of that news, and is kept.
+ */
+function isSubscriptionEcho(message: PendingMessage, carried: Set<number>): boolean {
+	// Every system notice today is from `[hcom-events]`; `sender_kind` is the
+	// row's own marking of the same thing.
+	if (message.from !== "[hcom-events]" && message.sender_kind !== "system") return false;
+	const text = typeof message.message === "string" ? message.message : "";
+	return referencedEventIds(text).some((id) => carried.has(id));
+}
+
+/**
+ * Split one `omp-read` fetch into the rows that may be injected and the echoes
+ * dropped from it.
+ *
+ * Runs once, on the fetched rows, before ids, gate markers and text are
+ * derived: all three then describe the same rows. A dropped row left in the
+ * gate markers would owe transcript evidence for text that is never injected,
+ * and the batch could never settle (the echo's own `messagePart`).
+ */
+function splitSubscriptionEchoes(messages: PendingMessage[]): {
+	deliverable: PendingMessage[];
+	dropped: PendingMessage[];
+} {
+	const carried = new Set<number>();
+	for (const message of messages) {
+		const id = Number(message.event_id);
+		if (Number.isInteger(id) && id > 0) carried.add(id);
+	}
+	const deliverable: PendingMessage[] = [];
+	const dropped: PendingMessage[] = [];
+	for (const message of messages) {
+		if (isSubscriptionEcho(message, carried)) dropped.push(message);
+		else deliverable.push(message);
+	}
+	return { deliverable, dropped };
 }
 
 /**
@@ -155,12 +212,100 @@ function injectedIds(prior: PendingAck | null, messages: PendingMessage[]): numb
 	return [...ids].sort((a, b) => a - b);
 }
 
+/**
+ * Exact event ids to name in `omp-read --ack --ids`: every injected row, plus a
+ * discarded echo below the batch's high-water id.
+ *
+ * `ack_by_ids` rejects a batch that omits an unread delivered message below its
+ * high-water id, and a discarded echo is unread until some ack names it. Left
+ * unnamed below the high-water, it keeps every later ack rejected and the
+ * cursor frozen on mail the model already read. Above it the cursor stops short
+ * of the echo either way, so it is left for a later pass.
+ */
+function ackedIds(prior: PendingAck | null, deliverable: PendingMessage[], dropped: PendingMessage[]): number[] {
+	const ids = new Set<number>(injectedIds(prior, deliverable));
+	const highWater = Math.max(...ids);
+	for (const message of dropped) {
+		const id = Number(message.event_id);
+		if (Number.isInteger(id) && id > 0 && id < highWater) ids.add(id);
+	}
+	return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * A deferred injection whose transcript evidence is still owed. A `followUp` is
+ * drained by a later run and an idle prompt starts the run that must consume it,
+ * so the cursor may only move over either once the prompt carrying it is durably
+ * in the transcript. `offset` is the transcript size at injection: an identical
+ * line written earlier is not evidence. A `null` path can never be satisfied —
+ * fail closed toward unread.
+ */
+type PersistGate = {
+	path: string | null;
+	offset: number;
+	markers: string[];
+};
+
 /** A batch with `omp-read --ack` still owed. Tracked so the ack names its exact ids. */
 type PendingAck = {
 	ids: number[];
 	/** High-water id, used only when the batch carried no usable ids (`--up-to`). */
 	maxId: number;
+	/** Empty only for immediate consumption: a steer into a live turn, and the
+	 * bodyless-wake transform, whose text no measurement shows landing verbatim. */
+	gates: PersistGate[];
 };
+
+/** Transcript size now, so evidence written later can be told apart. */
+function transcriptOffset(path: string | null): number {
+	if (!path) return 0;
+	try {
+		return statSync(path).size;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Text of every user entry appended past `gate.offset`. The transcript escapes
+ * quotes and newlines, so entries are parsed rather than string-searched.
+ */
+function persistedUserTexts(gate: PersistGate): string[] {
+	if (!gate.path) return [];
+	let region: string;
+	try {
+		region = readFileSync(gate.path).subarray(gate.offset).toString("utf8");
+	} catch {
+		return [];
+	}
+	const texts: string[] = [];
+	for (const line of region.split("\n")) {
+		if (!line.trim()) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry?.message?.role !== "user") continue;
+		const content = entry.message.content;
+		if (typeof content === "string") texts.push(content);
+		else if (Array.isArray(content)) {
+			for (const part of content) {
+				if (typeof part?.text === "string") texts.push(part.text);
+			}
+		}
+	}
+	return texts;
+}
+
+/** Whether every owed marker is now in the transcript. No gates = settled. */
+function gatesSatisfied(batch: PendingAck): boolean {
+	return batch.gates.every((gate) => {
+		const texts = persistedUserTexts(gate);
+		return gate.markers.every((marker) => texts.some((text) => text.includes(marker)));
+	});
+}
 
 /** `omp-read --ack` reports a rejected batch as exit 0 + `{"error": ...}`, cursor untouched. */
 function ackRejection(stdout: string): string | null {
@@ -455,12 +600,21 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		try {
 			const pending = await fetchPending();
 			if (!pending) return false;
+			// Before any id, marker or text is derived: an echo dropped later
+			// strands the batch it was dropped from.
+			const { deliverable, dropped } = splitSubscriptionEchoes(pending.messages);
+			if (dropped.length > 0) {
+				log("DEBUG", "plugin.subscription_echo_dropped", instanceName, {
+					ids: injectedIds(null, dropped),
+					count: dropped.length,
+				});
+			}
 			const prior = pendingAck;
 			// A deferred batch is already in the model's context; only newer mail is
 			// injected, and the ack keeps naming both (newest supersedes, oldest is
 			// never silently swept under the cursor).
 			const tracked = new Set(prior?.ids ?? []);
-			const fresh = pending.messages.filter((message) => !tracked.has(Number(message.event_id)));
+			const fresh = deliverable.filter((message) => !tracked.has(Number(message.event_id)));
 			if (fresh.length === 0) return false;
 			const isIdle = ctx.isIdle();
 			const plan = decideInjection(fresh, isIdle);
@@ -472,7 +626,34 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 				});
 				return false;
 			}
-			const batch: PendingAck = { ids: injectedIds(prior, pending.messages), maxId: pending.maxId };
+			// A follow-up is drained by a later run and an idle prompt starts the
+			// run that must consume it, so both acks owe transcript evidence: the
+			// session that cannot run a turn (expired auth, provider outage) then
+			// holds its mail instead of consuming it silently. An earlier unsettled
+			// batch's gates ride along, so a newer batch cannot settle mail the
+			// transcript still has not kept.
+			//
+			// A steer into a live turn is not gated: a turn is already running, so
+			// the "session cannot run a turn" risk does not apply, and nothing
+			// measures its text landing in the transcript - a marker that never
+			// appears would hold the batch forever.
+			const gates: PersistGate[] = [...(prior?.gates ?? [])];
+			if (plan.deliverAs !== "steer") {
+				const transcriptPath = ctx.sessionManager.getSessionFile() ?? null;
+				// Bound to a const: a nested closure does not keep the non-null
+				// narrowing of the mutable `instanceName`.
+				const recipient = instanceName;
+				gates.push({
+					path: transcriptPath,
+					offset: transcriptOffset(transcriptPath),
+					markers: fresh.map((message) => messagePart(message, recipient)),
+				});
+			}
+			const batch: PendingAck = {
+				ids: ackedIds(prior, deliverable, dropped),
+				maxId: pending.maxId,
+				gates,
+			};
 			pendingAck = batch;
 			try {
 				const formatted = formatMessagesForInjection(fresh, instanceName);
@@ -485,11 +666,10 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 					idle: isIdle,
 					deliver_as: plan.deliverAs ?? null,
 				});
-				// A steer (always into a live run) is consumed by that run's steering
-				// poll; no `deliverAs` means `sendUserMessage` took the `prompt()`
-				// path and the message IS the turn. Either way the batch is consumed
-				// now. A `followUp` waits for the run that drains it.
-				if (plan.deliverAs !== "followUp") await ackPending("delivery");
+				// A steer (always into a live run) IS the consuming turn, so it
+				// settles now; a followUp and an idle prompt wait for the run that
+				// drains or starts from them, and for the write that proves it.
+				await settlePendingAck("delivery");
 				return true;
 			} catch (error) {
 				if (pendingAck === batch) pendingAck = prior;
@@ -577,6 +757,20 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		} finally {
 			if (ackInFlight === attempt) ackInFlight = null;
 		}
+	}
+
+	/**
+	 * Ack the tracked batch, but only once every deferred injection in it is
+	 * durably in the transcript. A batch with no gates settles exactly as before.
+	 */
+	async function settlePendingAck(source: string): Promise<boolean> {
+		const batch = pendingAck;
+		if (batch === null) return false;
+		if (!gatesSatisfied(batch)) {
+			log("DEBUG", "plugin.ack_held_unpersisted", instanceName, { ids: batch.ids, source });
+			return false;
+		}
+		return ackPending(source);
 	}
 
 	async function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
@@ -745,11 +939,9 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		currentCtx = ctx;
 		clearIdleTimer();
 		agentActive = true;
-		// A tracked batch is a follow-up injected with an explicit `deliverAs`;
-		// its consuming run begins here (the queued-message drain, or a wake
-		// transform). `before_agent_start` fires only inside `prompt()`, so a
-		// follow-up drained at idle would never be acknowledged without this.
-		if (pendingAck !== null) await ackPending("agent_start");
+		// The run that drains a follow-up starts here, but the prompt may not be
+		// on disk yet: settle only against transcript evidence.
+		await settlePendingAck("agent_start");
 		await reportStatus(ctx, "active", "agent");
 	});
 
@@ -758,19 +950,30 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		await bindIdentity(ctx);
 		if (!instanceName) return {};
 		if (event.source === "extension") {
-			await ackPending("extension");
+			await settlePendingAck("extension");
 			return {};
 		}
 		if (isBodylessWake(event.text)) {
 			const pending = await fetchPending();
+			if (!pending) return { handled: true };
+			const { deliverable, dropped } = splitSubscriptionEchoes(pending.messages);
 			const prior = pendingAck;
 			const tracked = new Set(prior?.ids ?? []);
-			const fresh = (pending?.messages ?? []).filter((message) => !tracked.has(Number(message.event_id)));
-			if (!pending || fresh.length === 0) return { handled: true };
-			// The submission carrying this wake IS the consuming turn, so even a
-			// `queue` batch held at idle rides the transform instead of starting a
-			// turn of its own.
-			pendingAck = { ids: injectedIds(prior, pending.messages), maxId: pending.maxId };
+			const fresh = deliverable.filter((message) => !tracked.has(Number(message.event_id)));
+			if (fresh.length === 0) return { handled: true };
+			// The submission carrying this wake IS the consuming turn, so the batch
+			// rides the transform instead of starting a turn of its own. At an idle
+			// session nothing waits: there `decideInjection` delivers BOTH lanes as
+			// a prompt, and the wake transform only ever carries a batch for a
+			// session a submission is already waking. A `queue` batch waits only
+			// against a turn already in flight, where it is delivered at the
+			// boundary.
+			//
+			// `gates: []` is deliberate and stays that way: this text is delivered
+			// as a transform payload, and nothing measures it landing verbatim in
+			// the transcript (the delivery path's own blob does). Gating on
+			// evidence that may never arrive would hold the batch forever.
+			pendingAck = { ids: ackedIds(prior, deliverable, dropped), maxId: pending.maxId, gates: [] };
 			return { text: formatMessagesForInjection(fresh, instanceName) };
 		}
 		await reportStatus(ctx, "active", event.text.trim() === "<hcom>" ? "trigger" : "prompt");
@@ -787,7 +990,7 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 		// never re-emits an input event with source "extension", so the input
 		// handler's extension-ack branch is dead for the transform path. A
 		// follow-up drained at idle takes the agent_start path instead.
-		if (pendingAck !== null) await ackPending("before_agent_start");
+		await settlePendingAck("before_agent_start");
 		if (!bootstrapText) return undefined;
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
@@ -841,6 +1044,8 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 
 	pi.on("turn_end", async (_event, ctx) => {
 		currentCtx = ctx;
+		// The turn boundary is where a follow-up's own persisted prompt settles.
+		await settlePendingAck("turn_end");
 		await deliverPending(ctx);
 	});
 

@@ -436,7 +436,14 @@ fn prepare_resume_plan_from_source(
     };
 
     // Extract hcom-level flags from extra args before tool parsing.
-    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
+    let (dir_override, launch_flags, remaining) = extract_resume_flags(extra_args);
+    // Worlds (ayn.91) appends an absolute generation ompalt after --go.
+    // That is argv0, not a tool-arg; only honor it for omp identity.
+    let (tool_binary, clean_extra) = if tool == "omp" || tool == "omp-agent" {
+        crate::launcher::peel_generation_launcher(&remaining)
+    } else {
+        (None, remaining)
+    };
 
     // The snapshot directory belongs to the session that just turned out to be
     // a corpse; when a recoverable session was substituted, its own recorded
@@ -482,6 +489,10 @@ fn prepare_resume_plan_from_source(
     } else {
         Vec::new()
     };
+    // A previous resume that treated the generation path as a tool-arg may have
+    // baked it into launch_args. Drop it on replay so it is never forwarded,
+    // and never treat the stored copy as argv0 — only this launch's extra is.
+    let original_args = crate::launcher::peel_generation_launcher(&original_args).1;
     let persisted_args = build_persisted_args(&tool, &original_args, &clean_extra);
 
     let mut cli_tool_args = match &resume_session {
@@ -617,6 +628,7 @@ fn prepare_resume_plan_from_source(
             // reset; don't dilute it with a reply-handoff suffix. Adoption-fork
             // has no identity-reset prompt, so normal handoff rules apply.
             append_reply_handoff,
+            tool_binary,
         },
         last_event_id,
         session_id: resume_session.unwrap_or_default(),
@@ -2706,6 +2718,46 @@ mod tests {
             ),
             s(&["--thinking", "high"])
         );
+    }
+
+    #[test]
+    fn peel_generation_ompalt_is_argv0_not_a_tool_arg() {
+        let ompalt = "/home/sf/worktrees/omp/generations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/packages/coding-agent/scripts/ompalt";
+        let extras = s(&["--thinking", "high", ompalt]);
+        let (bin, rest) = crate::launcher::peel_generation_launcher(&extras);
+        assert_eq!(bin.as_deref(), Some(ompalt));
+        assert_eq!(rest, s(&["--thinking", "high"]));
+        assert_eq!(
+            build_persisted_args("omp", &s(&["--model", "opus"]), &rest),
+            s(&["--model", "opus", "--thinking", "high"]),
+            "peeled extras must not persist the generation path"
+        );
+        assert!(
+            !build_persisted_args("omp", &[], &rest)
+                .iter()
+                .any(|a| a.contains("ompalt")),
+        );
+    }
+
+    #[test]
+    fn stored_launch_args_ompalt_is_stripped_not_replayed() {
+        let ompalt = "/home/sf/worktrees/omp/generations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/packages/coding-agent/scripts/ompalt";
+        let stored = s(&["--model", "opus", ompalt]);
+        let cleaned = crate::launcher::peel_generation_launcher(&stored).1;
+        assert_eq!(cleaned, s(&["--model", "opus"]));
+        assert_eq!(
+            build_persisted_args("omp", &cleaned, &[]),
+            s(&["--model", "opus"])
+        );
+    }
+
+    #[test]
+    fn peel_generation_ompalt_does_not_steal_resume_paths_or_relative_names() {
+        let transcript = "/home/sf/.omp/agent/sessions/59898.jsonl";
+        let extras = s(&["--resume", transcript, "scripts/ompalt", "/tmp/other.sh"]);
+        let (bin, rest) = crate::launcher::peel_generation_launcher(&extras);
+        assert!(bin.is_none(), "flag values and relative names are not launchers");
+        assert_eq!(rest, extras);
     }
 
     #[test]

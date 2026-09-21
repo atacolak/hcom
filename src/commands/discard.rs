@@ -155,9 +155,7 @@ pub fn cmd_discard(db: &HcomDb, args: &DiscardArgs, ctx: Option<&CommandContext>
                 if args.json {
                     print_json(serde_json::json!({"error": "already_retired", "name": name}));
                 } else {
-                    eprintln!(
-                        "Error: '{name}' was already stopped/killed; its name stays retired"
-                    );
+                    eprintln!("Error: '{name}' was already stopped/killed; its name stays retired");
                 }
             } else if args.json {
                 print_json(serde_json::json!({"error": "not_found", "name": name}));
@@ -275,7 +273,10 @@ mod tests {
             .execute("UPDATE instances SET session_id='s1', status='listening', status_context='start' WHERE name='luna'", [])
             .unwrap();
         let reasons = committed_reasons(&db, &placeholder_row(&db, "luna"));
-        assert!(reasons.iter().any(|r| r.contains("session bound")), "{reasons:?}");
+        assert!(
+            reasons.iter().any(|r| r.contains("session bound")),
+            "{reasons:?}"
+        );
         assert!(db.get_instance_full("luna").unwrap().is_some());
     }
 
@@ -287,7 +288,10 @@ mod tests {
         db.log_event("status", "luna", &serde_json::json!({"status":"active"}))
             .unwrap();
         let reasons = committed_reasons(&db, &placeholder_row(&db, "luna"));
-        assert!(reasons.iter().any(|r| r.contains("event(s) authored")), "{reasons:?}");
+        assert!(
+            reasons.iter().any(|r| r.contains("event(s) authored")),
+            "{reasons:?}"
+        );
     }
 
     #[test]
@@ -305,7 +309,10 @@ mod tests {
         )
         .unwrap();
         let reasons = committed_reasons(&db, &placeholder_row(&db, "luna"));
-        assert!(reasons.iter().any(|r| r.contains("addressed by")), "{reasons:?}");
+        assert!(
+            reasons.iter().any(|r| r.contains("addressed by")),
+            "{reasons:?}"
+        );
     }
 
     #[test]
@@ -366,13 +373,13 @@ mod tests {
         insert_placeholder(&db, "luna");
         let me = std::process::id() as i64; // guaranteed alive
         db.conn()
-            .execute(
-                "UPDATE instances SET pid=?1 WHERE name='luna'",
-                params![me],
-            )
+            .execute("UPDATE instances SET pid=?1 WHERE name='luna'", params![me])
             .unwrap();
         let reasons = committed_reasons(&db, &placeholder_row(&db, "luna"));
-        assert!(reasons.iter().any(|r| r.contains("live process")), "{reasons:?}");
+        assert!(
+            reasons.iter().any(|r| r.contains("live process")),
+            "{reasons:?}"
+        );
     }
 
     fn go_ctx() -> crate::shared::CommandContext {
@@ -540,7 +547,10 @@ mod tests {
             "second discard appended another event"
         );
         let (_alive, taken) = crate::instance_names::collect_taken_names(&db).unwrap();
-        assert!(!taken.contains("luna"), "name re-taken by a failed second discard");
+        assert!(
+            !taken.contains("luna"),
+            "name re-taken by a failed second discard"
+        );
     }
 
     #[test]

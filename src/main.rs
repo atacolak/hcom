@@ -42,7 +42,6 @@ mod update;
 
 use anyhow::{Context, Result, bail};
 use std::panic;
-use std::str::FromStr;
 
 fn main() -> Result<()> {
     // Initialize global config from environment variables
@@ -127,11 +126,13 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     };
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
-    // delivery behavior merely because parsing failed.
-    let (ready_pattern, target) = match tool::Tool::from_str(tool_str) {
-        Ok(tool) => (tool.ready_pattern().to_vec(), pty::PtyTarget::Known(tool)),
-        Err(_) => (vec![], pty::PtyTarget::AdhocCommand(tool_str.to_string())),
-    };
+    // delivery behavior merely because parsing failed. An absolute generation
+    // ompalt is still OMP: argv0 is the path, identity is not Adhoc.
+    let target = pty::resolve_target(tool_str);
+    let ready_pattern = target
+        .known_tool()
+        .map(|tool| tool.ready_pattern().to_vec())
+        .unwrap_or_default();
 
     let instance_name = config::Config::get().instance_name;
 

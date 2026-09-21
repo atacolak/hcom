@@ -117,26 +117,40 @@ afterEach(async () => {
 });
 
 describe("decideInjection", () => {
-	test("holds an empty batch, steers a live run, and never starts a turn for queue", () => {
+	test("holds an empty batch and keeps lane semantics against a live run", () => {
 		expect(decideInjection([], true)).toBe("hold");
 		expect(decideInjection([message(1, "steer", "inform")], false)).toEqual({ deliverAs: "steer" });
-		expect(decideInjection([message(1, "queue", "request")], true)).toBe("hold");
+		expect(decideInjection([message(1, "queue", "request")], true)).toEqual({});
 		expect(decideInjection([message(1, "queue", "request")], false)).toEqual({ deliverAs: "followUp" });
 	});
 
-	test("demandingness covers the whole batch and absent fields are demanding auto", () => {
-		expect(decideInjection([message(1)], false)).toEqual({ deliverAs: "steer" });
-		expect(decideInjection([message(1, "auto", "inform")], false)).toEqual({ deliverAs: "followUp" });
+	test("absent, legacy auto, and unknown lanes all degrade to queue", () => {
+		expect(decideInjection([message(1)], true)).toEqual({});
+		expect(decideInjection([message(1)], false)).toEqual({ deliverAs: "followUp" });
+		expect(decideInjection([message(1, "auto", "request")], false)).toEqual({ deliverAs: "followUp" });
 		expect(decideInjection([message(1, "queue", "request"), message(2, "auto", "inform")], false)).toEqual({
-			deliverAs: "steer",
+			deliverAs: "followUp",
 		});
-		expect(decideInjection([message(1, "auto", "inform")], true)).toEqual({});
+		expect(decideInjection([message(1, "steer", "inform")], true)).toEqual({});
+	});
+
+	test("both lanes inject as a prompt at idle and diverge only against a live run", () => {
+		expect(decideInjection([message(1, "queue", "request")], true)).toEqual({});
+		expect(decideInjection([message(1, "steer", "request")], true)).toEqual({});
+		// Against a live turn the lanes differ: queue waits for the boundary,
+		// steer interrupts it.
+		expect(decideInjection([message(1, "queue", "request")], false)).toEqual({ deliverAs: "followUp" });
+		expect(decideInjection([message(1, "steer", "request")], false)).toEqual({ deliverAs: "steer" });
+	});
+
+	test("a mixed batch at idle still injects once", () => {
+		expect(decideInjection([message(1, "queue", "inform"), message(2, "steer", "inform")], true)).toEqual({});
 	});
 });
 
 describe("lane-aware delivery", () => {
-	test("idle demanding mail is injected as a prompt and acked through its high-water id", async () => {
-		const hcom = fakeHcom([message(101, "auto", "request"), message(102, "auto", "request")]);
+	test("idle steer mail is injected as a prompt and acked through its high-water id", async () => {
+		const hcom = fakeHcom([message(101, "steer", "request"), message(102, "steer", "request")]);
 		const ctx = fakeCtx(true);
 		const pi = await start(hcom, ctx);
 
@@ -160,8 +174,8 @@ describe("lane-aware delivery", () => {
 		expect(hcom.ackedTo()).toEqual([101]);
 	});
 
-	test("non-demanding auto waits for the run that drains it", async () => {
-		const hcom = fakeHcom([message(101, "auto", "inform")]);
+	test("a queue-lane batch waits for the run that drains it", async () => {
+		const hcom = fakeHcom([message(101, "queue", "inform")]);
 		const ctx = fakeCtx(false);
 		const pi = await start(hcom, ctx);
 
@@ -194,20 +208,36 @@ describe("lane-aware delivery", () => {
 		expect(hcom.mailbox.map((m) => m.event_id)).toEqual([101]);
 	});
 
-	test("queue mail is held at idle and never injected", async () => {
+	test("queue mail at idle is injected as a prompt and acked through its high-water id", async () => {
 		const hcom = fakeHcom([message(101, "queue", "request")]);
 		const ctx = fakeCtx(true);
 		const pi = await start(hcom, ctx);
 
 		await pi.emit("tool_result", { toolName: "read" }, ctx);
 
-		expect(pi.sent).toEqual([]);
-		expect(hcom.ackedTo()).toEqual([]);
-		expect(hcom.mailbox.map((m) => m.event_id)).toEqual([101]);
+		expect(pi.sent.length).toBe(1);
+		expect(pi.sent[0].options).toBeUndefined();
+		expect(pi.sent[0].text).toContain("body-101");
+		expect(hcom.ackedTo()).toEqual([101]);
+		expect(hcom.mailbox).toEqual([]);
+	});
+
+	test("a mixed batch at idle is injected once as a prompt", async () => {
+		const hcom = fakeHcom([message(101, "queue", "inform"), message(102, "steer", "request")]);
+		const ctx = fakeCtx(true);
+		const pi = await start(hcom, ctx);
+
+		await pi.emit("tool_result", { toolName: "read" }, ctx);
+
+		expect(pi.sent.length).toBe(1);
+		expect(pi.sent[0].options).toBeUndefined();
+		expect(pi.sent[0].text).toContain("body-101");
+		expect(pi.sent[0].text).toContain("body-102");
+		expect(hcom.ackedTo()).toEqual([102]);
 	});
 
 	test("an injected-but-unacked batch is not re-injected when the ack fails", async () => {
-		const hcom = fakeHcom([message(101, "auto", "request")]);
+		const hcom = fakeHcom([message(101, "steer", "request")]);
 		const ctx = fakeCtx(true);
 		const pi = await start(hcom, ctx);
 		hcom.setAckFailure(1);

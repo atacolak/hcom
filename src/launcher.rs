@@ -199,6 +199,10 @@ pub struct LaunchParams {
     pub skip_validation: bool,
     pub terminal: Option<String>,
     pub append_reply_handoff: bool,
+    /// Absolute generation `ompalt` to exec as argv0 instead of PATH `omp`.
+    /// Identity (`tool`, `HCOM_TOOL`) stays `omp`. Never persisted into
+    /// `launch_args` — worlds hands this on each generation-targeted resume.
+    pub tool_binary: Option<String>,
 }
 
 impl Default for LaunchParams {
@@ -222,6 +226,7 @@ impl Default for LaunchParams {
             skip_validation: false,
             terminal: None,
             append_reply_handoff: true,
+            tool_binary: None,
         }
     }
 }
@@ -249,6 +254,33 @@ fn find_tool_path(tool: &str) -> Option<String> {
 /// Check if tool CLI is installed (PATH + fallbacks).
 fn is_tool_installed(tool: &str) -> bool {
     find_tool_path(tool).is_some()
+}
+
+/// Absolute path whose basename is `ompalt`: a generation launcher, not a tool-arg.
+/// Worlds (ayn.91) appends this after `--go` on `hcom r` so the resumed pid execs
+/// that binary instead of PATH `omp`. Relative names and flagged values (`--resume
+/// /path.jsonl`) are not launchers.
+pub(crate) fn is_generation_ompalt(arg: &str) -> bool {
+    if arg.is_empty() || arg.starts_with('-') {
+        return false;
+    }
+    let path = std::path::Path::new(arg);
+    path.is_absolute() && path.file_name().and_then(|n| n.to_str()) == Some("ompalt")
+}
+
+/// Pull generation `ompalt` paths out of extras so they never become tool-args
+/// or `launch_args`. Last match wins; earlier copies are also dropped.
+pub(crate) fn peel_generation_launcher(extras: &[String]) -> (Option<String>, Vec<String>) {
+    let mut launcher = None;
+    let mut kept = Vec::with_capacity(extras.len());
+    for arg in extras {
+        if is_generation_ompalt(arg) {
+            launcher = Some(arg.clone());
+            continue;
+        }
+        kept.push(arg.clone());
+    }
+    (launcher, kept)
 }
 
 pub fn will_run_in_current_terminal(
@@ -863,7 +895,9 @@ fn create_runner_script_windows(
     env: &HashMap<String, String>,
     tool_args: &[String],
     run_here: bool,
+    pty_binary: Option<&str>,
 ) -> Result<String> {
+    let pty_tool = pty_binary.unwrap_or(tool);
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
 
@@ -1004,7 +1038,15 @@ fn create_runner_script_windows(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "hcom".to_string());
     let run_line = if tool_args.is_empty() {
-        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
+        format!(
+            "& {} pty {}",
+            terminal::ps_quote(&hcom_bin),
+            if pty_tool.contains('/') || pty_tool.contains('\\') || pty_tool.contains(' ') {
+                terminal::ps_quote(pty_tool)
+            } else {
+                pty_tool.to_string()
+            }
+        )
     } else {
         let args_file = launch_dir.join(format!(
             "{}_{}_{}_{}.args.json",
@@ -1018,7 +1060,11 @@ fn create_runner_script_windows(
         format!(
             "& {} pty {} --hcom-args-file {}",
             terminal::ps_quote(&hcom_bin),
-            tool,
+            if pty_tool.contains('/') || pty_tool.contains('\\') || pty_tool.contains(' ') {
+                terminal::ps_quote(pty_tool)
+            } else {
+                pty_tool.to_string()
+            },
             terminal::ps_quote(&args_file.to_string_lossy())
         )
     };
@@ -1078,9 +1124,10 @@ pub fn create_runner_script(
     env: &HashMap<String, String>,
     tool_args: &[String],
     run_here: bool,
+    pty_binary: Option<&str>,
 ) -> Result<String> {
     if cfg!(windows) {
-        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here);
+        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here, pty_binary);
     }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
@@ -1165,6 +1212,14 @@ pub fn create_runner_script(
         path_dirs.push(dir.to_string_lossy().into_owned());
     }
 
+    let pty_tool = pty_binary.unwrap_or(tool);
+    if let Some(dir) = std::path::Path::new(pty_tool).parent() {
+        let d = dir.to_string_lossy().to_string();
+        if !d.is_empty() && !path_dirs.contains(&d) {
+            path_dirs.push(d);
+        }
+    }
+
     let tool_bin = tool
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
@@ -1219,7 +1274,7 @@ pub fn create_runner_script(
         path_export,
         use_exec,
         crate::tools::args_common::shell_quote(&native_bin_str),
-        tool,
+        crate::tools::args_common::shell_quote(pty_tool),
         tool_args_str,
     );
 
@@ -1269,6 +1324,7 @@ pub fn launch_pty(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    pty_binary: Option<&str>,
 ) -> Result<bool> {
     if env.get("HCOM_PROCESS_ID").is_none_or(|v| v.is_empty()) {
         crate::log::log_error(
@@ -1288,7 +1344,7 @@ pub fn launch_pty(
     apply_herdr_agent_hint(&mut runner_env, tool);
 
     let script_file =
-        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here)?;
+        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here, pty_binary)?;
 
     let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
@@ -1389,6 +1445,7 @@ fn launch_background_runner(
     tool_args: &[String],
     terminal_mode: Option<&str>,
     inside_ai_tool: bool,
+    pty_binary: Option<&str>,
 ) -> Result<(String, u32, String)> {
     let log_filename = format!(
         "background_{}_{}.log",
@@ -1401,7 +1458,7 @@ fn launch_background_runner(
     let mut runner_env = background_runner_env(tool, instance_env, instance_name);
     runner_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
     let script_file =
-        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false)?;
+        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false, pty_binary)?;
     let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
@@ -1444,6 +1501,7 @@ fn launch_pty_or_background(
             tool_args,
             ctx.terminal_mode,
             inside_ai_tool,
+            params.tool_binary.as_deref(),
         )?;
         finalize_background_launch(ctx, log_file, pid, effective_preset);
         Ok(true)
@@ -1464,6 +1522,7 @@ fn launch_pty_or_background(
             effective_run_here,
             ctx.terminal_mode,
             inside_ai_tool,
+            params.tool_binary.as_deref(),
         )?;
         if ok {
             ctx.handles
@@ -1487,6 +1546,11 @@ fn launch_pty_or_background(
 ///   place, so it must survive — bailing here broke every tracked `hcom f`.
 /// - Name held by anything else (listening/active/blocked) → Err.
 fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
+    // A former name reserved by `hcom rename` stays taken forever
+    // (historical stability; not discard).
+    if db.alias_current(name).ok().flatten().is_some() {
+        bail!("Instance name '{name}' is reserved (renamed away); use a different name");
+    }
     let Some(row) = db.get_instance(name).ok().flatten() else {
         return Ok(());
     };
@@ -1695,8 +1759,18 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
-    let tool_binary = normalized.cli_binary();
-    if !is_tool_installed(tool_binary) {
+    let tool_binary = params
+        .tool_binary
+        .as_deref()
+        .unwrap_or_else(|| normalized.cli_binary());
+    if params.tool_binary.is_some() {
+        if !std::path::Path::new(tool_binary).is_file() {
+            bail!(
+                "generation launcher '{}' is not a file — resumed pid would stay PATH omp",
+                tool_binary
+            );
+        }
+    } else if !is_tool_installed(tool_binary) {
         bail!("'{}' is not installed or not in PATH", tool_binary);
     }
 
@@ -3335,7 +3409,7 @@ mod tests {
             ("RORI_MY_VAR".to_string(), "myval".to_string()),
         ]);
 
-        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], false).unwrap();
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], false, None).unwrap();
 
         let content = std::fs::read_to_string(&script).unwrap();
         // Instance-state stripped from unset block
@@ -3373,7 +3447,7 @@ mod tests {
             ("RORI_MY_VAR".to_string(), "myval".to_string()),
         ]);
 
-        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true).unwrap();
+        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true, None).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let env_file = content
             .lines()
@@ -3393,7 +3467,10 @@ mod tests {
         let omp = background_runner_env("omp", &env, "luna");
         assert_eq!(omp.get("HERDR_AGENT").map(String::as_str), Some("omp"));
         let claude = background_runner_env("claude-pty", &env, "luna");
-        assert_eq!(claude.get("HERDR_AGENT").map(String::as_str), Some("claude"));
+        assert_eq!(
+            claude.get("HERDR_AGENT").map(String::as_str),
+            Some("claude")
+        );
         let unknown = background_runner_env("not-a-tool", &env, "luna");
         assert!(!unknown.contains_key("HERDR_AGENT"));
     }
@@ -3402,13 +3479,62 @@ mod tests {
     #[test]
     fn test_runner_script_exports_herdr_agent_on_wrapper() {
         let env = HashMap::from([("HERDR_AGENT".to_string(), "omp".to_string())]);
-        let script = create_runner_script("omp", "/tmp", "test", &env, &[], false).unwrap();
+        let script = create_runner_script("omp", "/tmp", "test", &env, &[], false, None).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         assert!(
             content.contains("export HERDR_AGENT=omp;"),
             "wrapper must export HERDR_AGENT so herdr detection sees through hcom pty"
         );
         std::fs::remove_file(&script).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_script_execs_absolute_ompalt_not_path_omp() {
+        let env = HashMap::from([("HCOM_TOOL".to_string(), "omp".to_string())]);
+        let ompalt = "/tmp/hcom-ayn91/packages/coding-agent/scripts/ompalt";
+        let script = create_runner_script(
+            "omp",
+            "/tmp",
+            "test",
+            &env,
+            &["--resume".into(), "sid".into()],
+            false,
+            Some(ompalt),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            content.contains(" pty ") && content.contains(ompalt),
+            "runner must exec the generation ompalt as hcom pty argv0: {content}"
+        );
+        assert!(
+            !content.contains(" pty omp "),
+            "PATH omp must not be the pty command: {content}"
+        );
+        assert!(
+            !content.contains(" pty omp\n") && !content.contains(" pty omp "),
+        );
+        std::fs::remove_file(&script).ok();
+    }
+
+    #[test]
+    fn peel_drops_every_ompalt_copy_and_keeps_flags() {
+        let a = "/abs/a/ompalt";
+        let b = "/abs/b/ompalt";
+        let extras: Vec<String> = ["--foo", a, "--bar", "1", b]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (bin, rest) = peel_generation_launcher(&extras);
+        assert_eq!(bin.as_deref(), Some(b), "last ompalt wins");
+        assert_eq!(
+            rest,
+            ["--foo", "--bar", "1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     // create_runner_script_windows() isn't cfg(windows)-gated (only its call
@@ -3425,7 +3551,7 @@ mod tests {
         ]);
 
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false).unwrap();
+            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false, None).unwrap();
 
         let bytes = std::fs::read(&script).unwrap();
         assert_eq!(
@@ -3478,7 +3604,7 @@ mod tests {
         ];
 
         let script =
-            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false).unwrap();
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false, None).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3509,7 +3635,7 @@ mod tests {
     fn test_runner_script_windows_no_args_skips_sidecar_file() {
         let env = HashMap::new();
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)
+            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false, None)
                 .unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let run_line = content
@@ -3626,6 +3752,20 @@ mod tests {
         assert!(err.contains("already exists"), "unexpected: {err}");
         // Row should still be present — no deletion on conflict.
         assert!(db.get_instance("rune").unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_rejects_former_name() {
+        // Bug caught: without this guard, `--instance <former>` mints onto a
+        // name rename reserved, and the alias then points at two actors.
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instance_aliases (former, current) VALUES ('luna', 'luna_lead')",
+                [],
+            )
+            .unwrap();
+        assert!(resolve_explicit_name_conflict(&db, "luna").is_err());
     }
 
     // ── inject_workspace_trust_args ──────────────────────────────────────────

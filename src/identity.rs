@@ -11,8 +11,9 @@ static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
 });
 
-/// Valid base instance name: lowercase letters, digits, underscore.
-static BASE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9_]+$").unwrap());
+/// Valid base instance name: 1-24 chars, starts with a lowercase letter, then
+/// lowercase letters, digits, or underscore. Frozen grammar (hcom-4n3.1).
+static BASE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9_]{0,23}$").unwrap());
 
 /// Dangerous characters for user-provided names (injection prevention).
 static DANGEROUS_CHARS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[|&;$`<>]").unwrap());
@@ -34,15 +35,22 @@ pub fn looks_like_agent_id(name: &str) -> bool {
     name.len() == 7 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Check if name is a valid base instance name (lowercase letters, digits, underscore).
+/// Check if name is a valid base instance name (frozen grammar; `all` and
+/// `instance_names::banned_names()` are reserved). The ONE shared validator
+/// for `--instance` mints, identity lookup, and `start --as` fresh claims.
 pub fn is_valid_base_name(name: &str) -> bool {
     BASE_NAME_RE.is_match(name)
+        && name != "all"
+        && !crate::instance_names::banned_names().contains(name)
 }
 
 /// Build error message for invalid base instance names.
 pub fn base_name_error(name: &str) -> String {
+    if name == "all" || crate::instance_names::banned_names().contains(name) {
+        return format!("Invalid instance name '{name}': reserved.");
+    }
     format!(
-        "Invalid instance name '{name}'. Use base name only (lowercase letters, numbers, underscore)."
+        "Invalid instance name '{name}'. Use 1-24 characters: start with a lowercase letter, then lowercase letters, numbers, or underscore."
     )
 }
 
@@ -127,6 +135,14 @@ pub fn resolve_display_name(db: &HcomDb, input_name: &str) -> Option<String> {
         return Some(input_name.to_string());
     }
 
+    // Former-name alias: a renamed actor's old name resolves to its current
+    // row. Former names stay taken, so this can never shadow a live name.
+    if let Ok(Some(current)) = db.alias_current(input_name)
+        && let Ok(Some(_)) = db.get_instance_full(&current)
+    {
+        return Some(current);
+    }
+
     for (i, _) in input_name.match_indices('-') {
         let tag = &input_name[..i];
         let name = &input_name[i + 1..];
@@ -202,8 +218,10 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
     let mut resolved_name = name.to_string();
 
-    // Reject invalid base names, but allow tag-name format (e.g. "team-luna")
-    if !looks_like_uuid(name) && !is_valid_base_name(name) {
+    // Reject invalid base names, but allow tag-name format (e.g. "team-luna").
+    // UUIDs and 7-char hex agent ids are exempt: they must reach the id
+    // lookups below even when they don't match the name grammar.
+    if !looks_like_uuid(name) && !looks_like_agent_id(name) && !is_valid_base_name(name) {
         // Try tag-name resolution before rejecting
         match resolve_display_name(db, name) {
             Some(base) => resolved_name = base,
@@ -221,6 +239,27 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
         return Ok(SenderIdentity {
             kind: SenderKind::Instance,
             name: resolved_name,
+            session_id: data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            instance_data: Some(data),
+        });
+    }
+
+    // 1b. Former-name alias (renamed actor's old name)
+    if let Ok(Some(current)) = db.alias_current(&resolved_name)
+        && let Ok(Some(data)) = db.get_instance(&current)
+    {
+        crate::log::log_info(
+            "identity",
+            "resolve_from_name",
+            &format!("name={}, method=alias, resolved={}", resolved_name, current),
+        );
+        return Ok(SenderIdentity {
+            kind: SenderKind::Instance,
+            name: current,
             session_id: data
                 .get("session_id")
                 .and_then(|v| v.as_str())
@@ -601,10 +640,17 @@ mod tests {
     fn test_is_valid_base_name() {
         assert!(is_valid_base_name("luna"));
         assert!(is_valid_base_name("test_name_123"));
+        assert!(is_valid_base_name("hello_world"));
+        assert!(is_valid_base_name("a")); // single letter
+        assert!(is_valid_base_name("abcdefghijklmnopqrstuvwx")); // 24 chars
         assert!(!is_valid_base_name("Luna")); // uppercase
         assert!(!is_valid_base_name("my-name")); // dash
         assert!(!is_valid_base_name("")); // empty
         assert!(!is_valid_base_name("name with space"));
+        assert!(!is_valid_base_name("9lives")); // must start with a letter
+        assert!(!is_valid_base_name("abcdefghijklmnopqrstuvwxy")); // 25 chars
+        assert!(!is_valid_base_name("all")); // reserved broadcast word
+        assert!(!is_valid_base_name("test")); // instance_names::banned_names
     }
 
     #[test]
@@ -669,6 +715,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_from_name_agent_id_digit_start() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", None, None);
+        db.conn().execute(
+            "UPDATE instances SET agent_id = '6d9cafa' WHERE name = 'luna'",
+            [],
+        ).unwrap();
+
+        // 7-char hex agent ids may start with a digit; the name-grammar gate
+        // must not reject them before the agent-id lookup runs.
+        let identity = resolve_from_name(&db, "6d9cafa").unwrap();
+        assert_eq!(identity.name, "luna");
+    }
+
+    #[test]
     fn test_resolve_from_name_tag_name() {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", None, Some("team"));
@@ -691,6 +752,24 @@ mod tests {
 
         let err = resolve_from_name(&db, "Invalid-Name!").unwrap_err();
         assert!(err.to_string().contains("Invalid instance name"));
+    }
+
+    #[test]
+    fn resolve_from_name_follows_rename_alias() {
+        let (db, _d) = make_test_db();
+        insert_instance(&db, "luna_lead", None, None);
+        db.conn()
+            .execute(
+                "INSERT INTO instance_aliases (former, current) VALUES ('luna', 'luna_lead')",
+                [],
+            )
+            .unwrap();
+
+        let id = resolve_from_name(&db, "luna").unwrap();
+        assert_eq!(id.name, "luna_lead");
+        assert!(matches!(id.kind, SenderKind::Instance));
+        // Unknown name still errors.
+        assert!(resolve_from_name(&db, "nobody").is_err());
     }
 
     // ── resolve_identity tests ─────────────────────────────────────────
@@ -986,6 +1065,28 @@ mod tests {
             ..default_instance()
         };
         assert_eq!(get_full_name(&tagged), "team-luna");
+    }
+
+    #[test]
+    fn resolve_display_name_follows_rename_alias() {
+        let (db, _d) = make_test_db();
+        insert_instance(&db, "luna_lead", None, None);
+        db.conn()
+            .execute(
+                "INSERT INTO instance_aliases (former, current) VALUES ('luna', 'luna_lead')",
+                [],
+            )
+            .unwrap();
+
+        // Former name resolves to the current row.
+        assert_eq!(resolve_display_name(&db, "luna").as_deref(), Some("luna_lead"));
+        // Exact name still wins.
+        assert_eq!(
+            resolve_display_name(&db, "luna_lead").as_deref(),
+            Some("luna_lead")
+        );
+        // Unknown name still misses.
+        assert_eq!(resolve_display_name(&db, "nobody"), None);
     }
 
     #[test]

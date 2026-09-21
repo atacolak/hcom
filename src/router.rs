@@ -36,6 +36,8 @@ const COMMANDS: &[&str] = &[
     "bundle",
     "kill",
     "discard",
+    "rename",
+    "delete",
     "term",
     "relay",
     "run",
@@ -55,7 +57,12 @@ fn is_launch_tool(name: &str) -> bool {
 /// happens before clap parsing.
 fn send_has_external_sender_flag(cmd_argv: &[String]) -> bool {
     cmd_argv.iter().any(|a| {
-        a == "--from" || a == "-b" || a == "--as-system" || a.starts_with("--as-system=")
+        a == "--from"
+            || a == "-b"
+            || a == "--as-overseer"
+            || a == "--as-system"
+            || a.starts_with("--as-system=")
+            || a.starts_with("--from=")
     })
 }
 
@@ -606,6 +613,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "list"
                     | "stop"
                     | "discard"
+                    | "rename"
+                    | "delete"
                     | "listen"
                     | "events"
                     | "transcript"
@@ -835,6 +844,18 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::discard::cmd_discard(&db, &args, Some(&ctx))
         ),
+        "rename" => clap_dispatch!(
+            crate::commands::rename::RenameArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::rename::cmd_rename(&db, &args, Some(&ctx))
+        ),
+        "delete" => clap_dispatch!(
+            crate::commands::delete::DeleteArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::delete::cmd_delete(&db, &args, Some(&ctx))
+        ),
         "listen" => clap_dispatch!(
             crate::commands::listen::ListenArgs,
             cmd,
@@ -1029,6 +1050,7 @@ mod tests {
     fn send_gate_bypass_flags() {
         assert!(send_has_external_sender_flag(&sv(&["--from", "x"])));
         assert!(send_has_external_sender_flag(&sv(&["-b"])));
+        assert!(send_has_external_sender_flag(&sv(&["--as-overseer"])));
         assert!(send_has_external_sender_flag(&sv(&[
             "--as-system",
             "omp-runtime"

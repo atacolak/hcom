@@ -251,18 +251,30 @@ pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashS
     let alive_names: HashSet<String> = instances.iter().map(|r| r.name.clone()).collect();
     let mut taken_names = alive_names.clone();
 
+    // Latest terminal event wins: a newer non-placeholder stopped/deleted supersedes. deleted releases the name (hcom delete); stopped retains it.
     let stopped: Vec<String> = {
         let mut stmt = db.conn().prepare(
-            "SELECT DISTINCT instance FROM events
-             WHERE type = 'life'
-               AND json_extract(data, '$.action') = 'stopped'
-               AND COALESCE(json_extract(data, '$.placeholder'), 0) != 1",
+            "SELECT DISTINCT instance FROM events e
+             WHERE e.type = 'life'
+               AND json_extract(e.data, '$.action') = 'stopped'
+               AND COALESCE(json_extract(e.data, '$.placeholder'), 0) != 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM events newer
+                   WHERE newer.type = 'life'
+                     AND newer.instance = e.instance
+                     AND json_extract(newer.data, '$.action') IN ('stopped', 'deleted')
+                     AND COALESCE(json_extract(newer.data, '$.placeholder'), 0) != 1
+                     AND newer.id > e.id
+               )",
         )?;
         stmt.query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect()
     };
     taken_names.extend(stopped);
+
+    // Former names reserved by `hcom rename` stay taken (historical stability).
+    taken_names.extend(crate::db::aliases::former_names(db)?);
 
     Ok((alive_names, taken_names))
 }
@@ -892,5 +904,104 @@ mod reservation_tests {
         // Default HcomConfig::timeout is 86400 (schema-equivalent default),
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(wait_timeout, Some(86400));
+    }
+}
+
+#[cfg(test)]
+mod delete_taken_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_db() -> (TempDir, HcomDb) {
+        let tmp = TempDir::new().unwrap();
+        let db = HcomDb::open_raw(&tmp.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (tmp, db)
+    }
+
+    fn life_event(db: &HcomDb, name: &str, action: &str, placeholder: bool) {
+        let data = if placeholder {
+            serde_json::json!({"action": action, "placeholder": true})
+        } else {
+            serde_json::json!({"action": action})
+        };
+        db.log_event("life", name, &data).unwrap();
+    }
+
+    fn taken(db: &HcomDb) -> std::collections::HashSet<String> {
+        collect_taken_names(db).unwrap().1
+    }
+
+    #[test]
+    fn stopped_keeps_name_taken() {
+        // Regression guard: plain stop still retires the name.
+        let (_t, db) = setup_db();
+        life_event(&db, "luna", "stopped", false);
+        assert!(taken(&db).contains("luna"));
+    }
+
+    #[test]
+    fn deleted_releases_stopped_name() {
+        // Bug caught: stopped clause ignores the newer deleted event, so a
+        // reclaimed-then-deleted name stays taken forever.
+        let (_t, db) = setup_db();
+        life_event(&db, "luna", "stopped", false);
+        life_event(&db, "luna", "deleted", false);
+        assert!(!taken(&db).contains("luna"), "deleted name still taken");
+    }
+
+    #[test]
+    fn stopped_after_deleted_retakes() {
+        // Re-mint then stop: the newer stopped event wins over the stale
+        // deleted one.
+        let (_t, db) = setup_db();
+        life_event(&db, "luna", "deleted", false);
+        life_event(&db, "luna", "stopped", false);
+        assert!(taken(&db).contains("luna"));
+    }
+
+    #[test]
+    fn deleted_only_is_free() {
+        let (_t, db) = setup_db();
+        life_event(&db, "luna", "deleted", false);
+        assert!(!taken(&db).contains("luna"));
+    }
+
+    #[test]
+    fn placeholder_stopped_still_ignored() {
+        // Discard's free path survives the rewrite.
+        let (_t, db) = setup_db();
+        life_event(&db, "luna", "stopped", true);
+        assert!(!taken(&db).contains("luna"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_env {
+    /// Sets HCOM_LAUNCHED=1 so is_inside_ai_tool() is true; restores on drop.
+    /// Tests using this guard must be #[serial].
+    pub(crate) struct InsideAiToolGuard {
+        previous: Option<String>,
+    }
+
+    impl InsideAiToolGuard {
+        pub(crate) fn set() -> Self {
+            let previous = std::env::var("HCOM_LAUNCHED").ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::set_var("HCOM_LAUNCHED", "1") };
+            Self { previous }
+        }
+    }
+
+    impl Drop for InsideAiToolGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var("HCOM_LAUNCHED", v),
+                    None => std::env::remove_var("HCOM_LAUNCHED"),
+                }
+            }
+        }
     }
 }

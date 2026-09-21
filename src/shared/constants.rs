@@ -10,7 +10,10 @@ use super::ansi::{
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// CLI sender identity (the human operator).
-pub const SENDER: &str = "bigboss";
+pub const SENDER: &str = "overseer";
+
+/// Former operator token. Historical mail and `@bigboss` still resolve here.
+pub const SENDER_FORMER: &str = "bigboss";
 
 /// System notification identity (launcher, watchdog, subscriptions).
 pub const SYSTEM_SENDER: &str = "hcom";

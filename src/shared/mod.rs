@@ -20,6 +20,7 @@ pub use constants::{
     MENTION_PATTERN,
     // Message constants
     SENDER,
+    SENDER_FORMER,
     // Status constants
     ST_ACTIVE,
     ST_BLOCKED,

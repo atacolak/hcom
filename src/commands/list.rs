@@ -3,6 +3,24 @@
 //!
 //! Supports: human-readable, --json, --names, --format, -v,
 //! single instance query (self/named), full listing with unread counts.
+//!
+//! Unread mail that is HELD is reported apart from unread mail that is about to
+//! be picked up: `+3 (2 held)` in the human render, `held_count` in `--json`.
+//! HELD means the row *waits* on something else, and that is the protocol the
+//! shipped client plugins implement: an idle (`listening`) lane-aware recipient
+//! polls its unread, and `decideInjection` delivers BOTH lanes there as a
+//! prompt — nothing waits at idle. The wait exists against a live turn, where a
+//! `queue` row rides to the turn boundary and only a `steer` interrupts it, and
+//! at an actor that is not polling at all. So a row is held when its lane is
+//! not `steer`, it sits past the recipient's cursor, and the recipient's
+//! *computed* status is not `listening` (a turn in flight, a launch that has not
+//! reached its poll loop, or an actor that is no longer running). That status is
+//! snapshotted once per command, so the count and the status printed beside it
+//! always come from one read. CAVEAT: the count assumes the recipient runs a
+//! lane-aware plugin; without one a `queue` row is injected as soon as the
+//! recipient polls, and never waits for a turn boundary. This is a surface over
+//! a rule that already exists — it changes no delivery, ack or cursor
+//! behaviour.
 
 use std::collections::HashMap;
 
@@ -10,8 +28,8 @@ use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
 use crate::instance_lifecycle::{
-    RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
-    get_instance_status,
+    ComputedStatus, RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders,
+    format_age, get_instance_status,
 };
 use crate::instances::is_remote_instance;
 use crate::shared::{
@@ -77,6 +95,122 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
         }
     }
     counts
+}
+
+/// Count unread messages that are HELD at `name`: rows on a lane other than
+/// `steer` that sit past the recipient's cursor while the recipient is not
+/// polling for them.
+///
+/// `steer` is the lane that never waits — it interrupts a live turn, and is
+/// otherwise delivered like any other lane. Every other lane waits: a `queue`
+/// row rides a live turn to its boundary, and at an actor that is not running
+/// nothing picks it up at all. So the recipient half is inverted relative to
+/// the intuitive reading of "idle": an idle (`listening`) lane-aware recipient
+/// polls, and `decideInjection` delivers both lanes there.
+///
+/// The lane half is the delivery path's own normalization, written in SQL: a
+/// row is on the steer lane only when `$.delivery` is exactly `steer`, and
+/// every other value — omitted, `auto` (retired as a sending lane but still
+/// present in mailboxes), unknown, or a non-string — is the fail-closed
+/// `queue` (see `crate::db::events`, and `laneOf` in both plugins). `IS NOT`
+/// rather than `!=` so a NULL `json_extract` (absent lane) is queue, not
+/// NULL-and-therefore-dropped.
+///
+/// The caller applies the recipient half (`held_count_for` /
+/// `get_held_counts_batch`); this is the row half.
+fn get_held_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE id > ? AND type = 'message'
+             AND json_extract(data, '$.delivery') IS NOT 'steer'
+             AND EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?)",
+            rusqlite::params![last_event_id, name],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+}
+
+/// The status snapshot for one run of `hcom list`, keyed by instance name.
+///
+/// `get_instance_status` is impure — it reads the clock and the wake-grace
+/// state, and it finalizes a launch-failure detail — and it is the recipient
+/// half of the held rule. Every consumer in one command must therefore read the
+/// same value: the held projection and the rows that print/emit a status all
+/// take this snapshot, so a count contradicting the status beside it is
+/// impossible by construction rather than merely unlikely. Callers index it
+/// with a name from the same `instances` slice.
+fn instance_statuses(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<String, ComputedStatus> {
+    instances
+        .iter()
+        .map(|inst| (inst.name.clone(), get_instance_status(inst, db)))
+        .collect()
+}
+
+/// Held count for one instance, given the status that instance already renders.
+///
+/// Both halves of the rule are HCOM-owned data: the row's lane and id vs the
+/// recipient's cursor (`instances.last_event_id`) and its status. HELD is the
+/// row that *waits*, so the recipient half is "not idle": an idle (`listening`)
+/// lane-aware recipient polls its unread and injects it, a live turn takes a
+/// `queue` row at its boundary, and an actor that is not running takes it
+/// whenever it next runs. The status is the *computed* one — the very string
+/// the row prints and emits as `status`, from the caller's one-per-command
+/// snapshot — so a held count can never contradict the status beside it. A
+/// remote instance is left at 0, matching `get_unread_counts_batch`.
+///
+/// See the module docs for the lane-aware-plugin caveat.
+fn held_count_for(db: &HcomDb, data: &InstanceRow, status: &str) -> i64 {
+    if status == ST_LISTENING || is_remote_instance(data) {
+        return 0;
+    }
+    get_held_count(db, &data.name, data.last_event_id)
+}
+
+/// Get HELD counts for all instances in batch, keyed by instance name, from the
+/// caller's status snapshot.
+fn get_held_counts_batch(
+    db: &HcomDb,
+    instances: &[InstanceRow],
+    statuses: &HashMap<String, ComputedStatus>,
+) -> HashMap<String, i64> {
+    let mut counts = HashMap::new();
+    for inst in instances {
+        let count = held_count_for(db, inst, &statuses[&inst.name].status);
+        if count > 0 {
+            counts.insert(inst.name.clone(), count);
+        }
+    }
+    counts
+}
+
+/// The `(unread, held)` pair for one instance, with held floored at unread.
+///
+/// The two counts are separate reads of the same mailbox, so they can disagree
+/// by a row consumed in between. Held is a subset of unread by definition, so
+/// the reported held is clamped to the reported unread: one payload can never
+/// carry `unread_count: 0` beside `held_count: 1`, and the human marker cannot
+/// vanish because `unread_suffix(0, n)` is empty.
+fn unread_and_held(
+    unread_counts: &HashMap<String, i64>,
+    held_counts: &HashMap<String, i64>,
+    name: &str,
+) -> (i64, i64) {
+    let unread = unread_counts.get(name).copied().unwrap_or(0);
+    let held = held_counts.get(name).copied().unwrap_or(0).min(unread);
+    (unread, held)
+}
+
+/// Human unread marker: ` +3`, or ` +3 (2 held)` when some of it is waiting on
+/// the recipient. Non-zero held only — the common case renders as before.
+fn unread_suffix(unread: i64, held: i64) -> String {
+    if unread <= 0 {
+        return String::new();
+    }
+    if held > 0 {
+        format!(" +{unread} ({held} held)")
+    } else {
+        format!(" +{unread}")
+    }
 }
 
 /// Main entry point for `hcom list` command.
@@ -220,13 +354,22 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
+    // Held counts are computed only for the output paths that render them: the
+    // names/--stopped paths stay as cheap as they were. The statuses are
+    // snapshotted once here and reused by both the held projection and the rows
+    // that print/emit a status, so the two cannot disagree.
+    let statuses = instance_statuses(db, &sorted_instances);
+    let held_counts = get_held_counts_batch(db, &sorted_instances, &statuses);
+
     if json_output || format_template.is_some() {
         let mut result_list: Vec<serde_json::Value> = Vec::new();
 
         for data in &sorted_instances {
             let full_name = get_full_name(data);
-            let cs = get_instance_status(data, db);
-            let (status, description, age_seconds) = (cs.status, cs.description, cs.age_seconds);
+            let cs = &statuses[&data.name];
+            let (status, description, age_seconds) =
+                (cs.status.as_str(), cs.description.as_str(), cs.age_seconds);
+            let (unread, held) = unread_and_held(&unread_counts, &held_counts, &data.name);
 
             // Get binding status
             let hooks_bound = db.has_session_binding(&data.name);
@@ -247,7 +390,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "status_detail": data.status_detail,
                 "status_age_seconds": age_seconds,
                 "description": description,
-                "unread_count": unread_counts.get(&data.name).copied().unwrap_or(0),
+                "unread_count": unread,
+                // Additive: unread rows that wait on the recipient (lane rule),
+                // floored at `unread_count` so the pair is never self-refuting.
+                "held_count": held,
                 "headless": data.background != 0,
                 "session_id": data.session_id.as_deref().unwrap_or(""),
                 "directory": data.directory,
@@ -358,22 +504,21 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         if is_remote_instance(data) {
             n += 9; // " [remote]"
         }
-        let uc = unread_counts.get(&data.name).copied().unwrap_or(0);
-        if uc > 0 {
-            n += format!(" +{uc}").len();
-        }
+        let (uc, hc) = unread_and_held(&unread_counts, &held_counts, &data.name);
+        n += unread_suffix(uc, hc).len();
         max_name_len = max_name_len.max(n);
     }
     let name_col_width = (max_name_len + 2).max(14);
 
     for data in &sorted_instances {
         let name = get_full_name(data);
-        let cs = get_instance_status(data, db);
-        let (status, age_str, description) = (cs.status, cs.age_string, cs.description);
-        let icon = status_icon(&status);
+        let cs = &statuses[&data.name];
+        let (status, age_str, description) =
+            (cs.status.as_str(), cs.age_string.as_str(), cs.description.as_str());
+        let icon = status_icon(status);
 
         let age_display = if age_str == "now" {
-            age_str.clone()
+            age_str.to_string()
         } else if !age_str.is_empty() {
             format!("{age_str} ago")
         } else {
@@ -416,13 +561,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             ""
         };
 
-        // Unread
-        let unread = unread_counts.get(&data.name).copied().unwrap_or(0);
-        let unread_str = if unread > 0 {
-            format!(" +{unread}")
-        } else {
-            String::new()
-        };
+        // Unread, with the part that waits on the recipient marked beside it
+        let (unread, held) = unread_and_held(&unread_counts, &held_counts, &data.name);
+        let unread_str = unread_suffix(unread, held);
 
         // Listening-since suffix: show idle duration for listening agents idle >= 60s
         let listening_since = if status == ST_LISTENING && cs.age_seconds >= 60 {
@@ -963,4 +1104,275 @@ fn get_recently_stopped(
         .filter_map(|r| r.ok())
         .filter(|name| !exclude_active.contains(name))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::{ST_ACTIVE, ST_INACTIVE};
+
+    /// A DB in a scratch dir. Nothing here reads or writes the ambient
+    /// HCOM_DIR: the held rule is a projection over rows already in this DB.
+    fn open_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        (dir, db)
+    }
+
+    /// Insert an instance. Listening instances get a heartbeat `now` so the
+    /// computed status stays `listening` instead of flipping to `inactive`.
+    fn insert_instance(db: &HcomDb, name: &str, status: &str, cursor: i64, remote: bool) {
+        let now = crate::shared::time::now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                   (name, tool, status, status_context, status_detail, created_at,
+                    status_time, last_stop, tcp_mode, directory, last_event_id,
+                    origin_device_id, background)
+                 VALUES (?, 'adhoc', ?, '', '', ?, ?, ?, 1, '/tmp', ?, ?, 0)",
+                rusqlite::params![name, status, now, now, now, cursor, remote.then_some("dev-2")],
+            )
+            .unwrap();
+    }
+
+    /// An instance whose *stored* status is `listening` while its heartbeat is
+    /// `age` seconds old, so its *computed* status is `inactive`: the two
+    /// strings disagree by construction, which is what pins the held projection
+    /// to the status the row actually renders.
+    fn insert_stale_listening_instance(db: &HcomDb, name: &str, age: i64, cursor: i64) {
+        let now = crate::shared::time::now_epoch_i64();
+        let stale = now - age;
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                   (name, tool, status, status_context, status_detail, created_at,
+                    status_time, last_stop, tcp_mode, directory, last_event_id,
+                    origin_device_id, background)
+                 VALUES (?, 'adhoc', ?, '', '', ?, ?, ?, 1, '/tmp', ?, NULL, 0)",
+                rusqlite::params![name, ST_LISTENING, now, stale, stale, cursor],
+            )
+            .unwrap();
+    }
+
+    /// A message row addressed to `to` on `lane`. `None` means the row carries
+    /// no lane at all (legacy/absent), which is the fail-closed `queue`.
+    fn log_message(db: &HcomDb, to: &str, lane: Option<&str>) -> i64 {
+        let mut data = serde_json::json!({
+            "from": "sender",
+            "scope": "agent",
+            "text": "hi",
+            "delivered_to": [to],
+        });
+        if let Some(lane) = lane {
+            data["delivery"] = serde_json::json!(lane);
+        }
+        db.log_event("message", "sender", &data).unwrap()
+    }
+
+    /// The hold rule, all four halves: lane, cursor, recipient state, and the
+    /// absent-lane default. Each assertion fails if any half is dropped or
+    /// inverted.
+    ///
+    /// "Held" means the row waits on something else. An idle (`listening`)
+    /// lane-aware recipient polls, and `decideInjection` delivers *both* lanes
+    /// as a prompt there, so nothing is held at idle; the wait exists against a
+    /// live turn (`queue` rides it to the boundary) and at a recipient that is
+    /// not running at all.
+    #[test]
+    fn held_counts_mark_queue_rows_that_wait_on_a_turn() {
+        let (_dir, db) = open_db();
+
+        // Idle + unread queue row → NOT held: the recipient's next poll picks it
+        // up and starts the consuming turn.
+        insert_instance(&db, "idle-queue", ST_LISTENING, 0, false);
+        log_message(&db, "idle-queue", Some("queue"));
+
+        // Idle + unread steer row → also not held: a steer is delivered too.
+        insert_instance(&db, "idle-steer", ST_LISTENING, 0, false);
+        log_message(&db, "idle-steer", Some("steer"));
+
+        // A turn in flight + queue row → held: it rides the turn to the boundary.
+        insert_instance(&db, "busy-queue", ST_ACTIVE, 0, false);
+        log_message(&db, "busy-queue", Some("queue"));
+
+        // A turn in flight + steer row → not held: a steer interrupts it now.
+        insert_instance(&db, "busy-steer", ST_ACTIVE, 0, false);
+        log_message(&db, "busy-steer", Some("steer"));
+
+        // Not running at all + queue row → held: it waits indefinitely.
+        insert_instance(&db, "dead-queue", ST_INACTIVE, 0, false);
+        log_message(&db, "dead-queue", Some("queue"));
+
+        // Turn in flight + queue row with no lane recorded (legacy row) → held,
+        // because an absent lane is the fail-closed default.
+        insert_instance(&db, "busy-legacy", ST_ACTIVE, 0, false);
+        log_message(&db, "busy-legacy", None);
+
+        // Turn in flight + `auto` row → held. `auto` is retired as a *sending*
+        // lane, but the delivery path still folds every non-`steer` value into
+        // `queue`, so rows already written on it wait exactly like queue rows.
+        insert_instance(&db, "busy-auto", ST_ACTIVE, 0, false);
+        log_message(&db, "busy-auto", Some("auto"));
+
+        // Turn in flight + a lane the delivery path has never heard of → held:
+        // `steer` is the one value that escapes the rule, everything else is
+        // queue.
+        insert_instance(&db, "busy-bogus", ST_ACTIVE, 0, false);
+        log_message(&db, "busy-bogus", Some("bogus"));
+
+        // Queue row at or below the cursor → already consumed, not held.
+        insert_instance(&db, "busy-read", ST_ACTIVE, 0, false);
+        let read_id = log_message(&db, "busy-read", Some("queue"));
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = ? WHERE name = 'busy-read'",
+                rusqlite::params![read_id],
+            )
+            .unwrap();
+
+        // Remote instance → left at 0, like `unread_count`.
+        insert_instance(&db, "remote-queue", ST_ACTIVE, 0, true);
+        log_message(&db, "remote-queue", Some("queue"));
+
+        let instances = db.iter_instances_full().unwrap();
+        let unread = get_unread_counts_batch(&db, &instances);
+        let statuses = instance_statuses(&db, &instances);
+        let held_counts = get_held_counts_batch(&db, &instances, &statuses);
+
+        assert_eq!(
+            held_counts.get("idle-queue"),
+            None,
+            "an idle recipient polls the row up, so it is not held; \
+             held={held_counts:?}"
+        );
+        assert_eq!(
+            unread.get("idle-queue").copied(),
+            Some(1),
+            "not-held is not the same as read: the row is still unread"
+        );
+        assert_eq!(
+            held_counts.get("idle-steer"),
+            None,
+            "no lane waits at idle; held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-queue").copied(),
+            Some(1),
+            "a queue row rides the live turn to its boundary; held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-steer"),
+            None,
+            "a steer interrupts the live turn instead of waiting; held={held_counts:?}"
+        );
+        assert_eq!(
+            unread.get("busy-steer").copied(),
+            Some(1),
+            "the steer row is still unread — held is a subset, not a rename"
+        );
+        assert_eq!(
+            held_counts.get("dead-queue").copied(),
+            Some(1),
+            "nothing polls a recipient that is not running; held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-legacy").copied(),
+            Some(1),
+            "an absent lane is the fail-closed queue; held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-auto").copied(),
+            Some(1),
+            "a retired-`auto` row is queue on the delivery path, so it waits; \
+             held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-bogus").copied(),
+            Some(1),
+            "only `steer` escapes the hold rule; held={held_counts:?}"
+        );
+        assert_eq!(
+            held_counts.get("busy-read"),
+            None,
+            "a row at or below the cursor is consumed, not held; held={held_counts:?}"
+        );
+        assert_eq!(unread.get("busy-read"), None, "cursor advanced past the row");
+        assert_eq!(
+            held_counts.get("remote-queue"),
+            None,
+            "remote recipients have no local lane projection; held={held_counts:?}"
+        );
+    }
+
+    /// A held row is a strict subset of the unread rows: a steer in the same
+    /// batch is unread and never waits.
+    #[test]
+    fn held_counts_never_exceed_unread_counts() {
+        let (_dir, db) = open_db();
+        insert_instance(&db, "miso", ST_ACTIVE, 0, false);
+        log_message(&db, "miso", Some("queue"));
+        log_message(&db, "miso", Some("steer"));
+        log_message(&db, "miso", Some("queue"));
+
+        let instances = db.iter_instances_full().unwrap();
+        let unread = get_unread_counts_batch(&db, &instances);
+        let statuses = instance_statuses(&db, &instances);
+        let held_counts = get_held_counts_batch(&db, &instances, &statuses);
+
+        assert_eq!(unread.get("miso").copied(), Some(3));
+        assert_eq!(held_counts.get("miso").copied(), Some(2));
+        assert!(held_counts["miso"] < unread["miso"]);
+    }
+
+    /// The recipient half of the rule is the *computed* status — the very string
+    /// the row prints and emits as `status` — not the stored one. A `listening`
+    /// row whose heartbeat went stale computes to `inactive`, and a recipient
+    /// that is not idle keeps its queue mail, so held must be 1 there: reading
+    /// the stored `listening` instead would publish a count beside a
+    /// contradicting status.
+    #[test]
+    fn held_counts_follow_the_computed_status_not_the_stored_one() {
+        let (_dir, db) = open_db();
+        insert_stale_listening_instance(&db, "stale-listening", 600, 0);
+        log_message(&db, "stale-listening", Some("queue"));
+
+        let instances = db.iter_instances_full().unwrap();
+        let statuses = instance_statuses(&db, &instances);
+
+        assert_eq!(
+            statuses["stale-listening"].status, ST_INACTIVE,
+            "a 600s-old heartbeat is not listening, whatever the row stores"
+        );
+        assert_eq!(
+            get_held_counts_batch(&db, &instances, &statuses).get("stale-listening").copied(),
+            Some(1),
+            "held must agree with the emitted status: an inactive recipient is not polling, \
+             so its queue row waits"
+        );
+    }
+
+    /// The reported pair is self-consistent: held never exceeds unread, so a
+    /// payload cannot say `unread 0` beside `held 1` — the shape that would
+    /// drop the human marker (`unread_suffix(0, n)` is empty) while claiming a
+    /// hold.
+    #[test]
+    fn held_is_floored_at_unread() {
+        let unread = HashMap::from([("miso".to_string(), 1i64)]);
+        let held = HashMap::from([("miso".to_string(), 3i64), ("empty".to_string(), 1i64)]);
+
+        assert_eq!(unread_and_held(&unread, &held, "miso"), (1, 1));
+        assert_eq!(unread_and_held(&unread, &held, "empty"), (0, 0));
+        assert_eq!(unread_and_held(&unread, &held, "absent"), (0, 0));
+    }
+
+    /// The human marker: held is shown only when it is non-zero, so the common
+    /// `+N` render is untouched.
+    #[test]
+    fn unread_suffix_marks_held_only_when_nonzero() {
+        assert_eq!(unread_suffix(3, 2), " +3 (2 held)");
+        assert_eq!(unread_suffix(1, 1), " +1 (1 held)");
+        assert_eq!(unread_suffix(3, 0), " +3");
+        assert_eq!(unread_suffix(0, 0), "");
+        assert_eq!(unread_suffix(0, 2), "");
+    }
 }

@@ -16,12 +16,15 @@
 //! - Reading instance status
 //! - Registering notify endpoints
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::shared::time::now_epoch_f64;
 
+pub(crate) mod aliases;
 mod claude_actors;
 mod events;
 mod instances;
@@ -37,7 +40,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -66,6 +69,13 @@ const MIGRATIONS: &[(i32, &str)] = &[
              ON claude_actor_capabilities(expires_at);
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
+    ),
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS instance_aliases (
+             former TEXT PRIMARY KEY,
+             current TEXT NOT NULL
+         );",
     ),
 ];
 
@@ -358,6 +368,12 @@ impl HcomDb {
 
             -- KV table
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+
+            -- Former-name aliases recorded by `hcom rename`
+            CREATE TABLE IF NOT EXISTS instance_aliases (
+                former TEXT PRIMARY KEY,
+                current TEXT NOT NULL
+            );
 
             -- Event indexes
             CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp);
@@ -967,10 +983,25 @@ impl HcomDb {
         // Delegates to db::subscriptions; events_sub: kv ownership lives there.
         subscriptions::send_message_as(self, sender_name, sender_kind, message)
     }
+
+    /// Current name for a former (renamed-away) name.
+    pub fn alias_current(&self, former: &str) -> Result<Option<String>> {
+        aliases::alias_current(self, former)
+    }
+
+    /// Full former → current alias map (send target resolution).
+    pub fn alias_map(&self) -> Result<HashMap<String, String>> {
+        aliases::alias_map(self)
+    }
+
+    /// All reserved former names (collected into the taken set).
+    pub fn former_names(&self) -> Result<Vec<String>> {
+        aliases::former_names(self)
+    }
 }
 
 /// Generate ISO timestamp for current time.
-pub(super) fn chrono_now_iso() -> String {
+pub(crate) fn chrono_now_iso() -> String {
     crate::shared::time::now_iso()
 }
 
@@ -1695,5 +1726,32 @@ pub(super) mod tests {
         assert_eq!(name, "luna");
 
         cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_migration_v19_adds_instance_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        {
+            let db = HcomDb::open_raw(&db_path).unwrap();
+            db.init_db().unwrap();
+            // Simulate a v18 DB: drop the new table, stamp the old version.
+            db.conn()
+                .execute_batch("DROP TABLE instance_aliases; PRAGMA user_version = 18;")
+                .unwrap();
+        }
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        let version: i32 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // Table exists and is queryable (would error if the migration missed it).
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM instance_aliases", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
     }
 }

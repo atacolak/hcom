@@ -193,11 +193,13 @@ impl HcomDb {
                     .get("_relay")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let delivery = json
-                    .get("delivery")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("auto")
-                    .to_string();
+                // The only lane a sender can ask for is "steer"; absent, legacy
+                // "auto" and anything unknown are the fail-closed "queue".
+                let delivery = match json.get("delivery").and_then(|v| v.as_str()) {
+                    Some("steer") => "steer",
+                    _ => "queue",
+                }
+                .to_string();
 
                 messages.push(Message {
                     from,
@@ -253,17 +255,13 @@ impl HcomDb {
         Ok((launcher, batch_id))
     }
 
-    /// Emit "ready" life event and check for batch completion notification.
+    /// Emit "ready" life event. No launcher mail: the spawn already printed
+    /// `Names:` / waited inline, and worlds mint returns the actor. Failure
+    /// still mails via `notify_batch_failure`.
     ///
     /// Called on first status update (when status_context was "new").
     pub(crate) fn emit_ready_event(&self, name: &str, status: &str, context: &str) -> Result<()> {
-        let (launcher, batch_id) =
-            self.emit_launch_lifecycle_event(name, "ready", status, context, None, None)?;
-        if launcher != "unknown"
-            && let Some(ref bid) = batch_id
-        {
-            self.check_batch_completion(&launcher, bid)?;
-        }
+        self.emit_launch_lifecycle_event(name, "ready", status, context, None, None)?;
         Ok(())
     }
 
@@ -308,91 +306,6 @@ impl HcomDb {
             Some(reason),
             Some(detail),
         )?;
-        Ok(())
-    }
-
-    /// Check if all instances in a launch batch are ready; send notification if so.
-    pub fn check_batch_completion(&self, launcher: &str, batch_id: &str) -> Result<()> {
-        // Find the launch event for this batch
-        let launch_data: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT data FROM events
-             WHERE type = 'life' AND instance = ?
-               AND json_extract(data, '$.action') = 'batch_launched'
-               AND json_extract(data, '$.batch_id') = ?
-             LIMIT 1",
-                params![launcher, batch_id],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let Some(data_str) = launch_data else {
-            return Ok(());
-        };
-        let data: serde_json::Value = serde_json::from_str(&data_str)?;
-        let expected = data.get("launched").and_then(|v| v.as_u64()).unwrap_or(0);
-        if expected == 0 {
-            return Ok(());
-        }
-
-        // Count ready events with matching batch_id
-        let ready_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM events
-             WHERE type = 'life'
-               AND json_extract(data, '$.action') = 'ready'
-               AND json_extract(data, '$.batch_id') = ?",
-            params![batch_id],
-            |row| row.get(0),
-        )?;
-
-        if (ready_count as u64) < expected {
-            return Ok(());
-        }
-
-        // Check idempotency — don't send duplicate notification
-        let already_sent: bool = self.conn.query_row(
-            "SELECT COUNT(*) FROM events
-             WHERE type = 'message'
-               AND instance = 'sys_[hcom-launcher]'
-               AND json_extract(data, '$.text') LIKE ?
-             LIMIT 1",
-            params![format!("%batch: {}%", batch_id)],
-            |row| Ok(row.get::<_, i64>(0)? > 0),
-        )?;
-
-        if already_sent {
-            return Ok(());
-        }
-
-        // Get instance names from this batch
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT DISTINCT instance FROM events
-             WHERE type = 'life'
-               AND json_extract(data, '$.action') = 'ready'
-               AND json_extract(data, '$.batch_id') = ?",
-        )?;
-        let names: Vec<String> = stmt
-            .query_map(params![batch_id], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let instances_list = names.join(", ");
-        let text = format!(
-            "@{} All {} instances ready: {} (batch: {})",
-            launcher, expected, instances_list, batch_id
-        );
-
-        // Insert system message
-        let msg_data = serde_json::json!({
-            "from": "[hcom-launcher]",
-            "text": text,
-            "scope": "mentions",
-            "mentions": [launcher],
-            "sender_kind": "system",
-        });
-        self.log_event_with_ts("message", "sys_[hcom-launcher]", &msg_data, None)?;
-
         Ok(())
     }
 
@@ -721,6 +634,53 @@ mod tests {
         cleanup_test_db(db_path);
     }
 
+    #[test]
+    fn emit_ready_event_does_not_mail_the_launcher() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('midi', 1000.0), ('vemi', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "life",
+            "midi",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-ready-1",
+                "launched": 1,
+                "instances": ["vemi"]
+            }),
+        )
+        .unwrap();
+        db.emit_ready_event("vemi", "listening", "new").unwrap();
+        let mail: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'message'
+                   AND instance = 'sys_[hcom-launcher]'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mail, 0, "ready must not ping the launcher");
+        let ready: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life'
+                   AND instance = 'vemi'
+                   AND json_extract(data, '$.action') = 'ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready, 1);
+        cleanup_test_db(db_path);
+    }
+
     /// Regression: a broadcast must NOT count as direct unread for a dormant
     /// subagent, otherwise SubagentStop wakes every dormant subagent on every
     /// broadcast and the "no message in → no keep-alive" gate is broken.
@@ -778,7 +738,7 @@ mod tests {
     // ---- DeliveryLane ----
 
     #[test]
-    fn get_unread_messages_defaults_delivery_auto_for_legacy_rows() {
+    fn get_unread_messages_defaults_delivery_queue_for_legacy_rows() {
         let (db, db_path) = setup_full_test_db();
         db.conn
             .execute(
@@ -793,10 +753,19 @@ mod tests {
             &serde_json::json!({"from": "alice", "scope": "broadcast", "text": "hi"}),
         )
         .unwrap();
+        // pre-existing row written while the retired lane still existed
+        db.log_event(
+            "message",
+            "alice",
+            &serde_json::json!({"from": "alice", "scope": "broadcast", "text": "old",
+                                "delivery": "auto"}),
+        )
+        .unwrap();
 
         let msgs = db.get_unread_messages("bob");
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].delivery, "auto");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].delivery, "queue");
+        assert_eq!(msgs[1].delivery, "queue");
 
         cleanup_test_db(db_path);
     }

@@ -36,7 +36,7 @@ use nix::unistd::{Pid, pipe, read, write};
 #[cfg(unix)]
 use std::io;
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(unix)]
@@ -96,6 +96,30 @@ impl PtyTarget {
     pub(super) fn delivery_start_timeout(&self) -> Duration {
         Duration::from_secs(self.delivery_tool().spec().pty.delivery_start_timeout_secs)
     }
+}
+
+/// Identity of `hcom pty <first-arg>`.
+///
+/// A known tool name stays that tool. An absolute generation `ompalt` is still
+/// OMP (delivery, ready-pattern, hooks) even though argv0 is not PATH `omp` —
+/// `HCOM_TOOL` wins when set so a recycle that named a generation does not
+/// become Adhoc. Arbitrary commands stay explicitly ad-hoc, including when
+/// `HCOM_TOOL` is leftover in the environment (`hcom pty bash` from an omp
+/// session must not inherit OMP delivery).
+pub fn resolve_target(tool_str: &str) -> PtyTarget {
+    if let Ok(tool) = tool_str.parse::<Tool>() {
+        return PtyTarget::Known(tool);
+    }
+    if crate::launcher::is_generation_ompalt(tool_str) {
+        if let Some(tool) = std::env::var("HCOM_TOOL")
+            .ok()
+            .and_then(|s| s.parse::<Tool>().ok())
+        {
+            return PtyTarget::Known(tool);
+        }
+        return PtyTarget::Known(Tool::Omp);
+    }
+    PtyTarget::AdhocCommand(tool_str.to_string())
 }
 
 /// Tracks what type of incomplete escape sequence is pending on stdout.
@@ -600,6 +624,77 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Build the command for the wrapped tool.
+///
+/// The child runs in its own session with the pty slave as its controlling
+/// terminal and as all three stdio streams, so it is handed no descriptor of
+/// the caller's above stdio: the slave and master it is given are closed in the
+/// pre-exec hook below, and nothing else crosses the exec — no `Stdio` carrying
+/// a borrowed descriptor, no fd inherited through the environment, nowhere in
+/// this path that passes one (`openpty` pair only; the injection and notify
+/// endpoints are TCP ports).
+///
+/// The pre-exec hook runs after `fork` and before `exec`, so it may only make
+/// raw syscalls.
+#[cfg(unix)]
+fn pty_child_command(
+    command: &str,
+    args: &[&str],
+    env_vars: &[(String, String)],
+    slave_fd: RawFd,
+    master_fd: RawFd,
+) -> Command {
+    let mut command = Command::new(command);
+    command
+        .args(args)
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
+    // All operations are async-signal-safe (setsid, ioctl, dup2, close).
+    // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
+    unsafe {
+        command.pre_exec(move || {
+            // Create new session
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // Set controlling terminal
+            #[cfg(target_os = "linux")]
+            let tiocsctty = libc::TIOCSCTTY;
+            #[cfg(target_os = "android")]
+            let tiocsctty = libc::TIOCSCTTY as libc::c_int;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
+            if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // Redirect stdio to slave
+            if libc::dup2(slave_fd, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(slave_fd, 1) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(slave_fd, 2) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // Close slave fd if it's not stdio
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            // Close master fd — child should only have the slave side.
+            // Without this, the child holds a ref to the PTY master,
+            // preventing proper SIGHUP delivery on PTY teardown.
+            libc::close(master_fd);
+            Ok(())
+        });
+    }
+    // Last, over the fd table the hook above leaves behind: the child's stdio is
+    // the pty slave from here on, so nothing of the caller's above stdio is
+    // meant for it.
+    crate::sys::process::harden_child_fds(&mut command);
+    command
+}
+
 /// PTY proxy that manages the child process and I/O forwarding
 #[cfg(unix)]
 pub struct Proxy {
@@ -646,59 +741,15 @@ impl Proxy {
         terminal::setup_signal_handlers()?;
 
         // Spawn child process
-        let slave_fd = pty.slave.as_raw_fd();
-        let master_fd = pty.master.as_raw_fd();
-
-        // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
-        // All operations are async-signal-safe (setsid, ioctl, dup2, close).
-        // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
-        let child = unsafe {
-            Command::new(command)
-                .args(args)
-                .envs(
-                    config
-                        .env_vars
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str())),
-                )
-                .pre_exec(move || {
-                    // Create new session
-                    if libc::setsid() == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Set controlling terminal
-                    #[cfg(target_os = "linux")]
-                    let tiocsctty = libc::TIOCSCTTY;
-                    #[cfg(target_os = "android")]
-                    let tiocsctty = libc::TIOCSCTTY as libc::c_int;
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
-                    if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Redirect stdio to slave
-                    if libc::dup2(slave_fd, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 1) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 2) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Close slave fd if it's not stdio
-                    if slave_fd > 2 {
-                        libc::close(slave_fd);
-                    }
-                    // Close master fd — child should only have the slave side.
-                    // Without this, the child holds a ref to the PTY master,
-                    // preventing proper SIGHUP delivery on PTY teardown.
-                    libc::close(master_fd);
-                    Ok(())
-                })
-                .spawn()
-                .context("spawn failed")?
-        };
+        let child = pty_child_command(
+            command,
+            args,
+            &config.env_vars,
+            pty.slave.as_raw_fd(),
+            pty.master.as_raw_fd(),
+        )
+        .spawn()
+        .context("spawn failed")?;
 
         // Write PID and launch context to database for hcom kill
         if let Some(ref instance_name) = config.instance_name
@@ -1625,7 +1676,8 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+        PtyTarget, initialize_delivery_components, prompt_submit_observed, pty_child_command,
+        strip_focus_events,
     };
     use anyhow::anyhow;
     use rusqlite::Connection;
@@ -1638,6 +1690,96 @@ mod tests {
         assert_eq!(target.name(), "bash");
         assert_eq!(target.known_tool(), None);
         assert_eq!(target.delivery_tool(), crate::tool::Tool::Adhoc);
+    }
+
+    #[test]
+    fn generation_ompalt_path_is_known_omp() {
+        let path = "/home/sf/worktrees/omp/generations/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/packages/coding-agent/scripts/ompalt";
+        let target = super::resolve_target(path);
+        assert_eq!(target.known_tool(), Some(crate::tool::Tool::Omp));
+        assert_eq!(target.delivery_tool(), crate::tool::Tool::Omp);
+        assert_eq!(target.name(), "omp");
+    }
+
+    #[test]
+    fn bash_stays_adhoc_even_if_hcom_tool_is_omp() {
+        // Safety: this test process may inherit HCOM_TOOL=omp from the agent
+        // session. resolve_target must still treat `bash` as adhoc.
+        let target = super::resolve_target("bash");
+        assert_eq!(target.known_tool(), None);
+        assert_eq!(target.delivery_tool(), crate::tool::Tool::Adhoc);
+    }
+
+    /// The pty child's stdio is the pty slave, so nothing of the caller's above
+    /// stdio belongs to it. An agent session that runs `hcom pty <tool>`
+    /// directly reaches this spawn without passing [`spawn_detached`] or
+    /// [`exec_replace`] — the two boundaries that already apply this hygiene —
+    /// so the leak needs closing here too: pidtrack's live-owner probe reads the
+    /// launched pid's fd table as "sessions this process holds", and a launched
+    /// agent carrying the caller's transcript descriptor is read as a name steal
+    /// and never binds.
+    ///
+    /// [`spawn_detached`]: crate::sys::process::spawn_detached
+    /// [`exec_replace`]: crate::sys::process::exec_replace
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn pty_child_starts_without_the_callers_fds() {
+        use nix::pty::{Winsize, openpty};
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("2026-09-17T00-52-00-000Z_01a085ab.jsonl");
+        let path = CString::new(transcript.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: opening a path this test owns; the fd is closed below.
+        let inherited =
+            unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(
+            inherited > 2,
+            "expected a fresh descriptor above stdio, got {inherited}"
+        );
+
+        // A real pty pair, so the child sets up its session and stdio exactly as
+        // it does under `hcom pty`. Both ends outlive the child, which is not
+        // hung up on early.
+        let winsize = Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(&winsize, None).unwrap();
+        let verdict = dir.path().join("verdict");
+        let mut command = pty_child_command(
+            "bash",
+            &[
+                "-c",
+                &format!(
+                    "if [ -e /proc/self/fd/{inherited} ]; then verdict=inherited; \
+                     else verdict=clean; fi; printf %s \"$verdict\" > \"$HCOM_FD_VERDICT\""
+                ),
+            ],
+            &[],
+            pty.slave.as_raw_fd(),
+            pty.master.as_raw_fd(),
+        );
+        command.env("HCOM_FD_VERDICT", &verdict);
+
+        let mut child = command.spawn().unwrap();
+        let status = child.wait().unwrap();
+
+        // SAFETY: `inherited` was opened above and is unused from here on.
+        unsafe { libc::close(inherited) };
+
+        assert!(status.success(), "the pty child's probe failed: {status}");
+        assert_eq!(
+            std::fs::read_to_string(&verdict).unwrap_or_else(|error| panic!(
+                "the pty child left no verdict: {error}"
+            )),
+            "clean",
+            "the pty child inherited a caller descriptor; a launched agent holding \
+             the caller's transcript is read as a live-owner name steal"
+        );
     }
 
     fn setup_test_db(with_notify_endpoints: bool) -> PathBuf {

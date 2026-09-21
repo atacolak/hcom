@@ -21,7 +21,7 @@ use crate::shared::{
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
 const STATUS_SKIP_COMMANDS: &[&str] = &[
-    "listen", "start", "stop", "kill", "reset", "status", "discard",
+    "listen", "start", "stop", "kill", "reset", "status", "discard", "rename", "delete",
 ];
 
 /// Build a CommandContext for a CLI invocation (best-effort identity resolution).
@@ -69,7 +69,8 @@ pub fn build_ctx_for_command(
     } else {
         // No explicit name: best-effort, swallow errors
         let id =
-            identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok();
+            identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None)
+                .ok();
         from_binding = id.is_some();
         id
     };
@@ -610,7 +611,10 @@ mod tests {
             build_ctx_for_command(&db, Some("send"), None, false, Some("pid-1"), None).unwrap();
         assert!(ctx.identity.is_some());
         assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
-        assert!(ctx.identity_from_binding, "process binding is the caller's own binding");
+        assert!(
+            ctx.identity_from_binding,
+            "process binding is the caller's own binding"
+        );
     }
 
     #[test]

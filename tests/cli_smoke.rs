@@ -153,6 +153,158 @@ fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
     assert!(!events.contains("--name"), "events={events}");
 }
 
+/// End-to-end wire contract for the `hcom send --json` persist-time receipt.
+///
+/// The five-key object is read by other repos (worlds/soma), so the object's
+/// key set is asserted exactly: a renamed, dropped or newly added key must fail
+/// here. `--json` also wins over `--quiet`, and the error path keeps stdout
+/// silent so a caller parsing it can never mistake a diagnostic for a receipt.
+#[test]
+fn send_json_prints_persist_time_receipt() {
+    let h = Hcom::new();
+
+    // Parse + validate one receipt line. Returns the parsed object so callers
+    // can assert the fields that vary per invocation.
+    let receipt = |stdout: &str| -> serde_json::Value {
+        let mut lines = stdout.lines();
+        let line = lines.next().unwrap_or("");
+        assert!(
+            lines.next().is_none(),
+            "expected exactly one line of stdout: stdout={stdout:?}"
+        );
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("receipt is not JSON: {e}\nstdout={stdout}"));
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("receipt is not an object: stdout={stdout}"));
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "accepted_at",
+                "delivered_to",
+                "delivery",
+                "event_id",
+                "from"
+            ],
+            "receipt key set is the wire contract: stdout={stdout}"
+        );
+
+        assert!(
+            v["event_id"].as_i64().is_some_and(|id| id > 0),
+            "event_id must be a committed row id: stdout={stdout}"
+        );
+        assert_eq!(v["from"], "cli", "from must echo --from: stdout={stdout}");
+        let delivered_to = v["delivered_to"]
+            .as_array()
+            .unwrap_or_else(|| panic!("delivered_to must be an array: stdout={stdout}"));
+        assert!(
+            delivered_to.iter().all(serde_json::Value::is_string),
+            "delivered_to must hold strings: stdout={stdout}"
+        );
+        assert!(v["delivery"].is_string(), "stdout={stdout}");
+        let accepted_at = v["accepted_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("accepted_at must be a string: stdout={stdout}"));
+        chrono::DateTime::parse_from_rfc3339(accepted_at).unwrap_or_else(|e| {
+            panic!("accepted_at must be an RFC3339 timestamp: {e}\nstdout={stdout}")
+        });
+        v
+    };
+
+    // `queue` is the documented default lane, and omission must not invent a lane.
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--from",
+        "cli",
+        "@bigboss",
+        "--",
+        "receipt please",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let queued = receipt(&stdout);
+    assert_eq!(queued["delivery"], "queue", "stdout={stdout}");
+
+    // An explicit lane rides all the way into the receipt, and each receipt
+    // names its own row.
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--delivery",
+        "steer",
+        "--from",
+        "cli",
+        "@bigboss",
+        "--",
+        "steer please",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let steered = receipt(&stdout);
+    assert_eq!(steered["delivery"], "steer", "stdout={stdout}");
+    assert!(
+        steered["event_id"].as_i64() > queued["event_id"].as_i64(),
+        "each receipt quotes its own row: stdout={stdout}"
+    );
+
+    // --json wins over --quiet instead of cancelling out.
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--quiet",
+        "--from",
+        "cli",
+        "@bigboss",
+        "--",
+        "quiet please",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    receipt(&stdout);
+
+    // `delivered_to` names the concrete instances the row is addressed to.
+    // @bigboss is a virtual identity, so the address only materializes for a
+    // registered recipient.
+    let recipient = h.start();
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--from",
+        "cli",
+        &format!("@{recipient}"),
+        "--",
+        "addressed",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let addressed = receipt(&stdout);
+    assert_eq!(
+        addressed["delivered_to"],
+        serde_json::json!([recipient.as_str()]),
+        "stdout={stdout}"
+    );
+
+    // Unknown targets fail before anything is written: diagnostics go to stderr
+    // and stdout stays byte-empty so no caller can parse a receipt out of it.
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--from",
+        "cli",
+        "@nobody-here",
+        "--",
+        "nope",
+    ]);
+    assert_ne!(code, 0, "unknown target must fail: stderr={stderr}");
+    assert!(
+        stdout.is_empty(),
+        "error path must print no receipt: stdout={stdout:?}"
+    );
+    assert!(
+        stderr.contains("@nobody-here"),
+        "the failure must name the unresolved target: stderr={stderr}"
+    );
+}
+
 #[test]
 fn ai_tool_broadcast_to_many_requires_go_preview() {
     let h = Hcom::new();
@@ -457,11 +609,11 @@ fn start_as_reclaims_stopped_identity() {
 }
 
 #[test]
-fn bigboss_send_bypasses_identity_gate() {
-    // Wiki contract (messaging.md §@bigboss + reference_send_bigboss_flag memory):
-    // `send -b` is sender-as-bigboss and bypasses the identity gate that
-    // normally requires `--name` / a bound session. Sender_kind=external
+fn overseer_send_bypasses_identity_gate() {
+    // `send -b` / `--as-overseer` is sender-as-overseer and bypasses the identity
+    // gate that normally requires a bound session. Sender_kind=external
     // distinguishes the message from instance-to-instance traffic.
+    // Former token `bigboss` still addresses the operator; new mail stamps `overseer`.
     let h = Hcom::new();
     let recipient = h.start();
 
@@ -469,26 +621,25 @@ fn bigboss_send_bypasses_identity_gate() {
     let (c, _, stderr) = h.run(["send", "-b", &format!("@{recipient}"), "--", "from above"]);
     assert_eq!(c, 0, "send -b must bypass identity gate; stderr={stderr}");
     assert!(
-        !stderr.contains("identity not found"),
+        __omp_shell("stderr.contains("identity not found"),")
         "gate should not fire under -b; stderr={stderr}"
     );
 
     // --full bypasses streamlining so sender_kind is visible.
     let (_, events_out, _) = h.run([
-        "events", "--type", "message", "--from", "bigboss", "--last", "5", "--full",
+        "events", "--type", "message", "--from", "overseer", "--last", "5", "--full",
     ]);
     let msg: serde_json::Value = events_out
         .lines()
         .find_map(|l| serde_json::from_str(l).ok())
-        .expect("bigboss message event");
-    assert_eq!(msg["data"]["from"], "bigboss");
+        .expect("overseer message event");
+    assert_eq!(msg["data"]["from"], "overseer");
     assert_eq!(msg["data"]["text"], "from above");
     assert_eq!(
         msg["data"]["sender_kind"], "external",
-        "bigboss must record as external sender; msg={msg}"
+        "overseer must record as external sender; msg={msg}"
     );
 }
-
 #[test]
 fn config_unknown_key_is_not_set() {
     let h = Hcom::new();
@@ -1164,4 +1315,244 @@ fn pi_e2e_hook_dispatch() {
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap_or_else(|| panic!("stopped event missing: {stdout}"));
     assert_eq!(stopped["data"]["action"].as_str(), Some("stopped"));
+}
+
+/// Write a message row addressed to `to` straight into the fixture DB, with
+/// `delivery` set to `lane` — a JSON value, so a non-string lane can be
+/// expressed — or omitted entirely when `lane` is `None` (the legacy shape).
+///
+/// The fixture DB is written directly because `hcom send --delivery` accepts
+/// only `steer|queue`: the lanes that *only* the delivery path's normalization
+/// can still see (`auto`, retired as a sending lane but still in mailboxes, and
+/// a value no version ever wrote) cannot be produced through the CLI at all,
+/// which is exactly why the shipped predicate drifted from it.
+fn insert_lane_fixture(h: &Hcom, to: &str, lane: Option<serde_json::Value>) {
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open hcom db");
+    let mut data = serde_json::json!({
+        "from": "sender",
+        "scope": "mentions",
+        "sender_kind": "instance",
+        "mentions": [to],
+        "text": "lane fixture",
+        "delivered_to": [to],
+    });
+    if let Some(lane) = lane {
+        data["delivery"] = lane;
+    }
+    conn.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', 'sender', ?1)",
+        rusqlite::params![data.to_string()],
+    )
+    .expect("insert lane fixture message");
+}
+
+/// `hcom list` must separate unread mail that WAITS on the recipient from
+/// unread mail the recipient is about to pick up — the outage signal that read
+/// as a generic `+N` for hours.
+///
+/// A row waits when its lane is anything but `steer`, it sits past the
+/// recipient's cursor, and the recipient is NOT idle: the lane rule the shipped
+/// plugins implement (`decideInjection` delivers BOTH lanes at an idle session,
+/// so nothing waits there; a `queue` row rides a live turn to its boundary and
+/// a `steer` interrupts it) plus the delivery path's own lane normalization.
+/// The recipients' states are set through the omp plugin's own status call, so
+/// the fixture reaches `listening`/`active` exactly the way a lane-aware
+/// receiver does.
+#[test]
+fn list_marks_unread_that_waits_on_a_turn() {
+    let h = Hcom::new();
+    let sender = h.start();
+    // Idle: polls its unread up, so its queue row does not wait.
+    let idle = h.start();
+    // A turn in flight: `queue` waits for the boundary, `steer` interrupts.
+    let queue_live = h.start();
+    let steered_live = h.start();
+    // Recipients whose mail carries a lane the CLI can no longer produce, plus
+    // one whose heartbeat is stale. See `insert_lane_fixture`.
+    let legacy_auto = h.start();
+    let unknown_lane = h.start();
+    let non_string_lane = h.start();
+    let stale = h.start();
+
+    let set_status = |name: &str, status: &str| {
+        let (code, stdout, stderr) = h.run(["omp-status", "--name", name, "--status", status]);
+        assert_eq!(code, 0, "omp-status {status} failed: {stderr} {stdout}");
+    };
+    for name in [
+        &idle,
+        &queue_live,
+        &steered_live,
+        &legacy_auto,
+        &unknown_lane,
+        &non_string_lane,
+        &stale,
+    ] {
+        set_status(name, "active");
+    }
+    // Only the idle fixture stays idle; the rest keep a turn in flight.
+    set_status(&idle, "listening");
+
+    let send = |to: &str, lane: &str| {
+        let (code, _stdout, stderr) = h.run([
+            "send",
+            &format!("@{to}"),
+            "--name",
+            &sender,
+            "--delivery",
+            lane,
+            "--",
+            "lane check",
+        ]);
+        assert_eq!(code, 0, "send --delivery {lane} failed: {stderr}");
+    };
+    send(&idle, "queue");
+    send(&queue_live, "queue");
+    send(&steered_live, "steer");
+    send(&stale, "queue");
+
+    // The retired and never-written lanes: queue on the delivery path all the
+    // same, so against a live turn they wait like a queue row. `7` is the
+    // non-string shape `.as_str()` folds to `None` (queue) — the case
+    // `COALESCE(x,'queue') = 'queue'` got wrong.
+    insert_lane_fixture(&h, &legacy_auto, Some(serde_json::json!("auto")));
+    insert_lane_fixture(&h, &unknown_lane, Some(serde_json::json!("bogus")));
+    insert_lane_fixture(&h, &non_string_lane, Some(serde_json::json!(7)));
+
+    // Backdate the stale recipient's heartbeat by 600s and pin its *stored*
+    // status to `listening`: the computed status is then `inactive` ("stale"),
+    // so the row waits — and the held projection must agree with the status the
+    // row emits instead of the stored one. Without the stored `listening` here
+    // the two agree and the fixture would prove nothing.
+    {
+        let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open hcom db");
+        let stale_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            - 600;
+        conn.execute(
+            "UPDATE instances SET status = 'listening', status_time = ?1, last_stop = ?1
+             WHERE name = ?2",
+            rusqlite::params![stale_at, stale],
+        )
+        .expect("backdate the stale recipient's heartbeat");
+        let stored: String = conn
+            .query_row(
+                "SELECT status FROM instances WHERE name = ?1",
+                rusqlite::params![stale],
+                |row| row.get(0),
+            )
+            .expect("read back the stale recipient's stored status");
+        assert_eq!(
+            stored, "listening",
+            "the fixture's point is a stored/computed disagreement"
+        );
+    }
+
+    // The idle fixture has no TCP notify endpoint, so `listening` is only fresh
+    // for 10s: re-arm its heartbeat after the fixture I/O and read the payload
+    // right away, so a mid-assertion flip to `inactive` (the heartbeat rule)
+    // cannot masquerade as a held-predicate failure. Everything else is `active`
+    // (immune for 300s), and `stale` is deliberately left backdated.
+    set_status(&idle, "listening");
+
+    // (unread, held, status) per instance, read from the wire shape worlds
+    // consumes. A row is read as one payload, so the three fields must agree
+    // with each other.
+    fn row(unread: u64, held: u64, status: &str) -> (u64, u64, String) {
+        (unread, held, status.to_string())
+    }
+    let rows = || -> std::collections::HashMap<String, (u64, u64, String)> {
+        let (code, stdout, stderr) = h.run(["list", "--json"]);
+        assert_eq!(code, 0, "list --json failed: {stderr}");
+        serde_json::from_str::<serde_json::Value>(&stdout)
+            .unwrap_or_else(|e| panic!("list json: {e}\n{stdout}"))
+            .as_array()
+            .unwrap_or_else(|| panic!("list json must be an array: {stdout}"))
+            .iter()
+            .map(|v| {
+                (
+                    v["name"].as_str().unwrap_or_default().to_string(),
+                    (
+                        v["unread_count"].as_u64().unwrap_or(0),
+                        v["held_count"]
+                            .as_u64()
+                            .unwrap_or_else(|| panic!("held_count missing: {stdout}")),
+                        v["status"].as_str().unwrap_or_default().to_string(),
+                    ),
+                )
+            })
+            .collect()
+    };
+
+    let by_name = rows();
+    assert_eq!(
+        by_name.get(&idle),
+        Some(&row(1, 0, "listening")),
+        "an idle lane-aware recipient polls its queue row up, so nothing waits; \
+         rows={by_name:?}"
+    );
+    assert_eq!(
+        by_name.get(&queue_live),
+        Some(&row(1, 1, "active")),
+        "a queue row rides the live turn to its boundary; rows={by_name:?}"
+    );
+    assert_eq!(
+        by_name.get(&steered_live),
+        Some(&row(1, 0, "active")),
+        "a steer interrupts the live turn instead of waiting; rows={by_name:?}"
+    );
+    for legacy in [&legacy_auto, &unknown_lane, &non_string_lane] {
+        assert_eq!(
+            by_name.get(legacy),
+            Some(&row(1, 1, "active")),
+            "every non-`steer` lane is queue on the delivery path, so it waits \
+             like one; rows={by_name:?}"
+        );
+    }
+    assert_eq!(
+        by_name.get(&stale),
+        Some(&row(1, 1, "inactive")),
+        "the held count is the recipient half of the rule, read against the \
+         status the row emits: a stale heartbeat is inactive, not idle, so its \
+         queue row waits; rows={by_name:?}"
+    );
+
+    // Human render: the distinction rides beside the existing `+N`, and only
+    // when something is actually waiting.
+    let row_for = |out: &str, name: &str| -> String {
+        out.lines()
+            .find(|line| line.split_whitespace().any(|tok| tok == name))
+            .unwrap_or_else(|| panic!("no row for {name} in:\n{out}"))
+            .to_string()
+    };
+    let (code, human, stderr) = h.run(["list"]);
+    assert_eq!(code, 0, "list failed: {stderr}");
+    for waiting in [&queue_live, &legacy_auto, &unknown_lane, &non_string_lane, &stale] {
+        let waiting_row = row_for(&human, waiting);
+        assert!(
+            waiting_row.contains(&format!("{waiting} +1 (1 held)")),
+            "unread that waits must render as held beside +N: row={waiting_row:?}"
+        );
+    }
+    for prompt in [&idle, &steered_live] {
+        let row = row_for(&human, prompt);
+        assert!(
+            !row.contains("held"),
+            "unread that is about to be picked up must not claim a hold: row={row:?}"
+        );
+    }
+
+    // Cursor half: an explicit read consumes the waiting row, so it stops being
+    // unread — the projection never outlives the row it describes.
+    let (code, _stdout, stderr) =
+        h.run(["listen", "--name", &queue_live, "--timeout", "1", "--json"]);
+    assert_eq!(code, 0, "listen failed: {stderr}");
+    set_status(&queue_live, "active");
+    assert_eq!(
+        rows().get(&queue_live),
+        Some(&row(0, 0, "active")),
+        "a consumed row is neither unread nor held"
+    );
 }

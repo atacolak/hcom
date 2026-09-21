@@ -636,7 +636,7 @@ mod tests {
             "alice",
             &serde_json::json!({
                 "from": "alice", "scope": "mentions", "mentions": ["bob"],
-                "text": text, "delivered_to": ["bob"], "delivery": "auto",
+                "text": text, "delivered_to": ["bob"], "delivery": "queue",
             }),
         )
         .unwrap()
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn omp_read_raw_defaults_legacy_rows_to_auto() {
+    fn omp_read_raw_defaults_legacy_rows_to_queue() {
         let _env = isolated_test_env();
         let (db, path) = setup();
         // legacy row: written without the delivery key
@@ -852,7 +852,7 @@ mod tests {
         .unwrap();
         let (_, out) = handle_read(&db, &argv(&["--name", "bob"]));
         let msgs: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(msgs[0]["delivery"], "auto");
+        assert_eq!(msgs[0]["delivery"], "queue");
         cleanup(path);
     }
 
@@ -861,24 +861,27 @@ mod tests {
     fn omp_read_format_path_agrees_with_raw() {
         let _env = isolated_test_env();
         let (db, path) = setup();
-        send_lane_to_bob(&db, DeliveryLane::Queue, "queued");
+        send_lane_to_bob(&db, DeliveryLane::Steer, "steered");
         let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--format"]));
         assert!(
-            out.contains("queue"),
-            "format path must surface the lane: {out}"
+            out.contains("[steer "),
+            "format path must surface a non-default lane: {out}"
         );
-        assert!(out.contains("queued"));
+        assert!(out.contains("steered"));
         cleanup(path);
     }
 
     #[test]
     #[serial]
-    fn omp_read_format_path_hides_auto() {
+    fn omp_read_format_path_hides_the_default_lane() {
         let _env = isolated_test_env();
         let (db, path) = setup();
-        send_lane_to_bob(&db, DeliveryLane::Auto, "plain");
+        send_lane_to_bob(&db, DeliveryLane::Queue, "plain");
         let (_, out) = handle_read(&db, &argv(&["--name", "bob", "--format"]));
-        assert!(!out.contains("auto"), "auto lane must not add noise: {out}");
+        assert!(
+            !out.contains("[queue "),
+            "the default lane must not add noise: {out}"
+        );
         cleanup(path);
     }
 

@@ -82,31 +82,30 @@ export type PendingMessage = {
 	delivery?: string;
 };
 
-export type DeliveryLane = "auto" | "steer" | "queue";
+export type DeliveryLane = "steer" | "queue";
 
 /** Lane urgency; a batch resolves to its most urgent lane. */
-const LANE_RANK: Record<DeliveryLane, number> = { queue: 1, auto: 2, steer: 3 };
+const LANE_RANK: Record<DeliveryLane, number> = { queue: 1, steer: 2 };
 
 /** `"hold"` = inject nothing and ack nothing. Otherwise the exact `sendUserMessage` options. */
 export type InjectionPlan = "hold" | { deliverAs?: "steer" | "followUp" };
 
 function laneOf(message: PendingMessage): DeliveryLane {
-	// Absent (legacy row) or unknown lane degrades to "auto".
-	if (message.delivery === "steer" || message.delivery === "queue") return message.delivery;
-	return "auto";
+	// Absent (legacy row), the retired "auto" value, and anything unknown all
+	// degrade to "queue": the sender must ask for a steer explicitly.
+	return message.delivery === "steer" ? "steer" : "queue";
 }
 
 /**
  * Lane-aware plan for one unread batch.
  *
- * - `queue` at an idle session is HELD: injecting it would start a turn the
- *   sender did not ask for. It is delivered by the next trigger that finds a
- *   turn already in flight (or a bodyless wake carrying it).
- * - At idle a non-held batch is injected with NO `deliverAs`, so
- *   `sendUserMessage` takes the `prompt()` path and starts the consuming turn
- *   synchronously.
- * - With a turn in flight, `steer` — and any demanding `auto` batch — interrupts
- *   it; non-demanding `auto` and `queue` wait for the turn to end.
+ * At an idle session there is no turn to wait for, so BOTH lanes are delivered
+ * with NO `deliverAs`: `sendUserMessage` takes the `prompt()` path and starts
+ * the consuming turn synchronously. Holding `queue` there would deadlock on the
+ * very mail that must start that turn.
+ * - The lanes differ ONLY while a turn is in flight: `steer` interrupts it,
+ *   `queue` waits for the boundary. Intent never promotes a lane — a steer is
+ *   never inferred from a demanding message arriving at a busy actor.
  */
 export function decideInjection(messages: PendingMessage[], isIdle: boolean): InjectionPlan {
 	if (messages.length === 0) return "hold";
@@ -115,10 +114,8 @@ export function decideInjection(messages: PendingMessage[], isIdle: boolean): In
 		const candidate = laneOf(message);
 		if (LANE_RANK[candidate] > LANE_RANK[lane]) lane = candidate;
 	}
-	if (isIdle) return lane === "queue" ? "hold" : {};
-	// Absent intent is demanding; only an explicit `inform`/`ack` is not.
-	const demanding = messages.some((message) => message.intent !== "inform" && message.intent !== "ack");
-	return lane === "steer" || (lane === "auto" && demanding) ? { deliverAs: "steer" } : { deliverAs: "followUp" };
+	if (isIdle) return {};
+	return lane === "steer" ? { deliverAs: "steer" } : { deliverAs: "followUp" };
 }
 
 /**
@@ -496,9 +493,13 @@ export default function hcomExtension(pi: ExtensionAPI, deps: HcomDeps = {}) {
 			const tracked = new Set(prior?.ids ?? []);
 			const fresh = (pending?.messages ?? []).filter((message) => !tracked.has(Number(message.event_id)));
 			if (!pending || fresh.length === 0) return { action: "handled" };
-			// The submission carrying this wake IS the consuming turn, so even a
-			// `queue` batch held at idle rides the transform instead of starting a
-			// turn of its own.
+			// The submission carrying this wake IS the consuming turn, so the batch
+			// rides the transform instead of starting a turn of its own. At an idle
+			// session nothing waits: there `decideInjection` delivers BOTH lanes as
+			// a prompt, and the wake transform only ever carries a batch for a
+			// session a submission is already waking. A `queue` batch waits only
+			// against a turn already in flight, where it is delivered at the
+			// boundary.
 			pendingAck = { ids: injectedIds(prior, pending.messages), maxId: pending.maxId };
 			return { action: "transform", text: formatMessagesForInjection(fresh, instanceName) };
 		}

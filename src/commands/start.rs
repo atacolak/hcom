@@ -360,9 +360,19 @@ fn start_rebind(
 ) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
-    // Resolve the target name
-    let target_name = identity::resolve_display_name_or_stopped(db, rebind_target)
-        .unwrap_or_else(|| rebind_target.to_string());
+    // Resolve the target name. A target matching no live or stopped identity
+    // is a fresh claim: it must pass the shared name grammar (the same helper
+    // as the --instance mint), so every claimable name is resolvable. Targets
+    // that resolve are reclaimed as-is, even if they predate the grammar.
+    let target_name = match identity::resolve_display_name_or_stopped(db, rebind_target) {
+        Some(base) => base,
+        None => {
+            if !identity::is_valid_base_name(rebind_target) {
+                bail!("{}", identity::base_name_error(rebind_target));
+            }
+            rebind_target.to_string()
+        }
+    };
 
     // Guard: refuse to reclaim a subagent slot. Subagents share their parent's
     // session_id, so `hcom start --as <subagent_name>` from inside a subagent
@@ -1222,6 +1232,33 @@ mod tests {
             Some("nova"),
             "a start after the rebind returns the reclaimed identity"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_fresh_claim_uses_shared_grammar() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        assert!(crate::hooks::claude::setup_claude_hooks(false));
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-grammar-claim")),
+            "/tmp/project",
+        );
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+
+        // A minted-style chosen name is claimable and owns the session.
+        assert_eq!(start_rebind(&db, "hello_world", &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-grammar-claim").unwrap().as_deref(),
+            Some("hello_world"),
+            "start --as hello_world must resolve and own the session"
+        );
+
+        // Fresh claims outside the frozen grammar fail closed before mutation.
+        let err = start_rebind(&db, "bad-name", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("Invalid instance name"));
+        let err = start_rebind(&db, "all", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("reserved"));
     }
 
     #[test]

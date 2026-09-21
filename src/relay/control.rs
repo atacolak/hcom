@@ -4,7 +4,7 @@
 //! currently carry request/response style remote actions.
 
 use rumqttc::v5::mqttbytes::QoS;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 use crate::config::HcomConfig;
@@ -796,6 +796,7 @@ fn handle_remote_launch(
             skip_validation: false,
             terminal: request.terminal,
             append_reply_handoff: false,
+            tool_binary: None,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -1542,12 +1543,10 @@ mod tests {
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
         assert!(prepared.args.iter().any(|arg| arg == "-p"));
-        assert!(
-            prepared
-                .args
-                .windows(2)
-                .any(|w| w == ["--output-format", "stream-json"])
-        );
+        assert!(prepared
+            .args
+            .windows(2)
+            .any(|w| w == ["--output-format", "stream-json"]));
         assert!(prepared.args.iter().any(|arg| arg == "--verbose"));
     }
 
@@ -1565,12 +1564,10 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(
-            !prepared
-                .args
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
-        );
+        assert!(!prepared
+            .args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-p" | "--print")));
     }
 
     #[test]
@@ -1584,15 +1581,13 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(
-            crate::commands::launch::validate_claude_headless_launch(
-                &request.tool,
-                prepared.background,
-                &prepared.args,
-                request.initial_prompt.as_deref(),
-            )
-            .is_ok()
-        );
+        assert!(crate::commands::launch::validate_claude_headless_launch(
+            &request.tool,
+            prepared.background,
+            &prepared.args,
+            request.initial_prompt.as_deref(),
+        )
+        .is_ok());
     }
 
     #[test]

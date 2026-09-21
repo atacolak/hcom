@@ -316,6 +316,25 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_taken_names_includes_former_aliases() {
+        // Bug caught: rename reserves the old name; without this clause the
+        // mint re-issues a former name and the alias then points at two
+        // actors.
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instance_aliases (former, current) VALUES ('luna', 'luna_lead')",
+                [],
+            )
+            .unwrap();
+
+        let (_alive, taken) = collect_taken_names(&db).unwrap();
+        assert!(taken.contains("luna"));
+
+        cleanup(path);
+    }
+
+    #[test]
     fn test_save_instance_reservation_does_not_replace_existing_row() {
         let (db, path) = setup_test_db();
         let mut data = serde_json::Map::new();

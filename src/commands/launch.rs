@@ -202,6 +202,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             skip_validation: false,
             terminal,
             append_reply_handoff: true,
+            tool_binary: None,
         },
     )?;
 
@@ -495,9 +496,9 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
     let (flags, tool_args) = extract_launch_flags(&argv[idx..]);
 
     if let Some(name) = &flags.instance
-        && name.trim().is_empty()
+        && !crate::identity::is_valid_base_name(name)
     {
-        bail!("--instance requires a non-empty instance name");
+        bail!("{}", crate::identity::base_name_error(name));
     }
 
     Ok((count, tool, flags, tool_args))
@@ -1438,5 +1439,35 @@ mod tests {
     fn test_parse_launch_argv_instance_empty_fails() {
         assert!(parse_launch_argv(&s(&["omp", "--instance", ""])).is_err());
         assert!(parse_launch_argv(&s(&["omp", "--instance", "   "])).is_err());
+    }
+
+    #[test]
+    fn test_parse_launch_argv_instance_grammar() {
+        // Frozen grammar ^[a-z][a-z0-9_]{0,23}$: chosen names parse through.
+        let (_, _, flags, _) =
+            parse_launch_argv(&s(&["omp", "--instance", "hello_world"])).unwrap();
+        assert_eq!(flags.instance, Some("hello_world".to_string()));
+        let (_, _, flags, _) = parse_launch_argv(&s(&["omp", "--instance", "luna"])).unwrap();
+        assert_eq!(flags.instance, Some("luna".to_string()));
+        let (_, _, flags, _) = parse_launch_argv(&s(&["omp", "--instance=reko"])).unwrap();
+        assert_eq!(flags.instance, Some("reko".to_string()));
+
+        // Invalid names fail closed at parse with the shared validator error.
+        for bad in [
+            "my-name",                  // dash
+            "Luna",                     // uppercase
+            "9lives",                   // starts with a digit
+            "abcdefghijklmnopqrstuvwxy", // 25 chars
+            "all",                      // reserved
+            "test",                     // instance_names::banned_names
+        ] {
+            let err = parse_launch_argv(&s(&["omp", "--instance", bad])).unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid instance name"),
+                "--instance {bad:?} must fail with the shared validator error"
+            );
+        }
+        // Equals form is validated too.
+        assert!(parse_launch_argv(&s(&["omp", "--instance=all"])).is_err());
     }
 }

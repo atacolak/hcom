@@ -13,28 +13,66 @@ This fork adds transport-level capabilities on top of upstream. All are additive
 invocations are unchanged. Fork builds report version `0.7.26`, above the upstream `0.7.25`
 they fork.
 
-- **Delivery lanes.** `hcom send --delivery auto|steer|queue` (default `auto`) carries the
-  caller's intent for *how* a message should reach the receiver, and the lane is recorded
-  on the message envelope. Realization is per receiver state: `queue` neither starts an
-  otherwise-idle actor nor interrupts a turn (the message is held unread until that actor
-  next runs); `steer` starts one and interrupts whatever is in flight; `auto` starts an
-  idle actor like `steer`, but with a turn already in flight it interrupts only for a
-  demanding intent — `inform` and `ack` wait for the turn to end.
+- **Delivery lanes.** `hcom send --delivery steer|queue` carries the caller's intent for
+  *how* a message should reach the receiver, and the lane is recorded on the message
+  envelope. `queue` is the default. At an idle actor both lanes are delivered and a turn
+  starts; the lanes differ only while a turn is in flight — `queue` waits for that turn's
+  boundary rather than interrupting it, and `steer` interrupts it. `steer` must be asked
+  for explicitly. Intent never promotes a lane: a `request` rides `queue` like any other
+  message.
 - **Exact acks.** `hcom omp-read --name <actor> --ack --ids <id,...>` acks exactly the
   messages a client consumed. Idempotent, rejects ids that were not delivered to that
   actor, and refuses an incomplete batch so a partial ack cannot sweep unread mail. The
   high-water-mark `--ack` form is unchanged for legacy callers.
-- **Actor-attributed send.** `hcom send --as-instance` derives the sender from the caller's
-  own bound actor identity instead of a caller-supplied string, so actor-to-actor traffic is
-  recorded as `tori -> riko` rather than an external proxy. Fails closed when unbound, and
-  is mutually exclusive with `--from`/`-b`.
+- **Bound sender inference.** `hcom send` with no sender flag uses the caller's bound
+  instance identity (`tori -> riko`). Unbound callers are refused: agents raise to their
+  overseer; the human uses `--as-overseer` (legacy `-b`). `--as-system <id>` remains the
+  addressed-only script path. `--from` is named-external scripts. `--as-instance` is an
+  optional synonym of the default bound path.
+- **`hcom send --json`.** Prints a persist-time receipt on stdout instead of the human
+  prose, so a sender can thread a reply (`--reply-to <event_id>`) without scraping text. The
+  receipt is built from the committed row, so its `accepted_at` is that row's own
+  `events.timestamp`.
+- **Chosen names.** `--instance <name>` mints a chosen identity at launch (`^[a-z][a-z0-9_]{0,23}$`,
+  1–24 chars, start letter, no dashes). Omitted `--instance` still mints a 4-letter CVCV word.
+  `--name` stays caller identity, never the child.
 - **`hcom discard <name>`.** Retires a provisional identity that never committed any work,
-  freeing its four-letter name for reuse. Distinct from `stop` (name stays resumable) and
+  freeing the name for reuse. Distinct from `stop` (name stays resumable) and
   `kill` (name stays retired): `discard` refuses loudly if the actor has a bound session, a
   live process, any authored event, an addressed message, a child, or a binding.
+- **`hcom rename <old> <new>`.** Renames an instance whose process is stopped, rewriting live
+  bindings (session/process bindings, notify endpoints, capabilities, children). The former name
+  stays reserved and resolves to the new name; historical events and mail keep the old token.
+- **`hcom delete <name>`.** Removes a committed identity and frees the name. Requires a live
+  row with a dead process; refused while the pid is alive or live children exist. History and
+  former-name aliases stay. Distinct from `discard` (never-committed mints) and `stop`/`kill`
+  (name stays taken).
 
-The OMP and Pi extensions ship the matching lane-aware delivery and ack logic; a receiver
-running an older extension will still collapse all mail to a steer.
+`hcom send --json @luna -- "receipt please"`:
+
+```json
+{"accepted_at":"2026-09-16T09:05:43.883116+00:00","delivered_to":["luna"],"delivery":"queue","event_id":4128,"from":"nova"}
+```
+
+`accepted_at` is microsecond-precision UTC. The receipt is written when the row is
+committed, not when the recipient reads it: a `queue` row sent against a turn already in
+flight waits for that turn's boundary, so a receipt is never proof that the turn consumed
+it. `delivered_to` is the
+addressed-instance list for the row — routing, not consumption — and is `[]` when every
+target is virtual or unregistered.
+
+The handshake seam is three fields and nothing more. `event_id` is the durable handle a send
+returns, and the one `--reply-to` consumes; `reply-to` points at an `event_id` to answer it;
+`thread` groups a conversation so its members are subscribed. There is no separate registry
+and no capability negotiation — no receiver advertises what it can handle — and these three
+fields are the whole seam.
+
+The OMP and Pi extensions ship the matching lane-aware delivery and ack logic. `hcom send`
+records the lane on the row (`events.data.delivery`) regardless of receiver: an extension that
+supports lanes honors it — at an idle receiver both lanes deliver and start a turn, while
+against a turn in flight `queue` waits for the boundary and `steer` interrupts — while one
+predating lanes entirely has no lane handling and injects every message immediately. The wait
+a `queue` lane implies is a lane-aware receiver's behavior, not a transport promise.
 
 [![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
@@ -314,7 +352,7 @@ hcom launch flags:
 | Flag | Purpose |
 |---|---|
 | `--tag <name>` | Group label — agents can be addressed as `@tag` |
-| `--instance <name>` | Mint this name for the launched instance (fails if taken) |
+| `--instance <name>` | Mint this name (1–24 chars: start lowercase letter, then lowercase/digits/`_`; fails if taken). Omitted still mints a 4-letter CVCV word. |
 | `--terminal <preset>` | Where windows open: `default` (auto-detect), `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, etc… |
 | `--dir <path>` | Directory where the agent launches |
 | `--headless` | Run in background pty with no terminal window |
@@ -328,7 +366,7 @@ Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 
 ```bash
 hcom                                # TUI dashboard
-hcom send -b @luna -- hey           # one-off message to an agent
+hcom send --as-overseer @luna -- hey  # human one-off (legacy -b)
 hcom list                           # show all active agents
 hcom term [name]                    # view/inject into an agent's PTY screen
 hcom events --wait <filters>         # Block until match for scripting

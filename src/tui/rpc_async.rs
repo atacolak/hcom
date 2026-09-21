@@ -112,7 +112,7 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             intent,
             reply_to,
         } => {
-            let mut argv: Vec<String> = vec!["send".into(), "--from".into(), "bigboss".into()];
+            let mut argv: Vec<String> = vec!["send".into(), "--as-overseer".into()];
             if let Some(i) = intent {
                 argv.extend(["--intent".into(), i.clone()]);
             }

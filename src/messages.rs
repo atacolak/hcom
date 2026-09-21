@@ -1,6 +1,6 @@
 //! Message operations — routing, scope computation, and delivery formatting.
 
-use crate::shared::{MAX_MESSAGE_SIZE, SENDER, extract_mentions};
+use crate::shared::{MAX_MESSAGE_SIZE, SENDER, SENDER_FORMER, extract_mentions};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -72,19 +72,17 @@ impl std::str::FromStr for MessageIntent {
 /// Delivery lane for envelope: how the recipient's client should inject the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeliveryLane {
-    /// Client default (today: steer for the OMP plugin).
-    #[default]
-    Auto,
-    /// Interrupt/steer the active turn.
+    /// Interrupt/steer the active turn. Must be asked for explicitly.
     Steer,
-    /// Queue without interrupting.
+    /// Queue without interrupting. The fail-closed default: an omitted flag, an
+    /// unknown value, and a legacy row all mean this.
+    #[default]
     Queue,
 }
 
 impl DeliveryLane {
     pub fn as_str(&self) -> &'static str {
         match self {
-            DeliveryLane::Auto => "auto",
             DeliveryLane::Steer => "steer",
             DeliveryLane::Queue => "queue",
         }
@@ -96,12 +94,10 @@ impl std::str::FromStr for DeliveryLane {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Ok(DeliveryLane::Auto),
             "steer" => Ok(DeliveryLane::Steer),
             "queue" => Ok(DeliveryLane::Queue),
-            _ => Err(format!(
-                "invalid delivery lane: {s} (expected auto|steer|queue)"
-            )),
+            // "auto" is retired, not aliased: a caller asking for it is told.
+            _ => Err(format!("invalid delivery lane: {s} (expected steer|queue)")),
         }
     }
 }
@@ -248,6 +244,10 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
     msg
 }
 
+fn is_operator_token(name: &str) -> bool {
+    name.eq_ignore_ascii_case(SENDER) || name.eq_ignore_ascii_case(SENDER_FORMER)
+}
+
 /// Match a target against instance names.
 ///
 /// Resolution order:
@@ -256,8 +256,13 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
 /// 3. Exact tag group when the target ends in `-`
 /// 4. Unique remote prefix when the target contains `:`
 ///
-/// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
+/// Overseer:SUFFIX (and former bigboss:SUFFIX) resolves to the operator
+/// virtual identity, device-agnostic.
 fn match_target(target: &str, instances: &[InstanceInfo]) -> Result<Vec<String>, String> {
+    if is_operator_token(target) {
+        return Ok(vec![SENDER.to_string()]);
+    }
+
     let exact_base: Vec<String> = instances
         .iter()
         .filter(|inst| inst.name.eq_ignore_ascii_case(target))
@@ -267,10 +272,10 @@ fn match_target(target: &str, instances: &[InstanceInfo]) -> Result<Vec<String>,
         return Ok(dedup_preserving_order(&exact_base));
     }
 
-    // bigboss is device-agnostic — strip any remote suffix
+    // Operator identity is device-agnostic — strip any remote suffix.
     if target
         .split_once(':')
-        .is_some_and(|(base, _)| base.eq_ignore_ascii_case(SENDER))
+        .is_some_and(|(base, _)| is_operator_token(base))
     {
         return Ok(vec![SENDER.to_string()]);
     }
@@ -347,13 +352,21 @@ fn target_instances_with_sender(enabled_instances: &[InstanceInfo]) -> Vec<Insta
 pub(crate) fn resolve_targets(
     targets: &[String],
     enabled_instances: &[InstanceInfo],
+    aliases: &HashMap<String, String>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let target_instances = target_instances_with_sender(enabled_instances);
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
 
     for target in targets {
-        let target_matches = match_target(target, &target_instances)?;
+        let mut target_matches = match_target(target, &target_instances)?;
+        // Former-name alias: exact match first; on miss, a renamed actor's
+        // old name re-matches against its current name.
+        if target_matches.is_empty()
+            && let Some(current) = aliases.get(target)
+        {
+            target_matches = match_target(current, &target_instances)?;
+        }
         if target_matches.is_empty() {
             unmatched.push(target.clone());
         } else {
@@ -377,6 +390,7 @@ pub fn compute_scope(
     message: &str,
     enabled_instances: &[InstanceInfo],
     explicit_targets: Option<&[String]>,
+    aliases: &HashMap<String, String>,
 ) -> Result<ScopeResult, String> {
     let target_instances = target_instances_with_sender(enabled_instances);
     let full_names: Vec<String> = target_instances
@@ -387,7 +401,7 @@ pub fn compute_scope(
     // If explicit targets specified (via -- separator), use them instead of parsing @mentions
     if let Some(targets) = explicit_targets {
         if !targets.is_empty() {
-            let (matched_base_names, unmatched) = resolve_targets(targets, enabled_instances)?;
+            let (matched_base_names, unmatched) = resolve_targets(targets, enabled_instances, aliases)?;
 
             if !unmatched.is_empty() {
                 return Err(build_unmatched_error(&unmatched, &full_names));
@@ -424,7 +438,7 @@ pub fn compute_scope(
 
         let mentions = extract_mentions(message);
         if !mentions.is_empty() {
-            let (matched_base_names, unmatched) = resolve_targets(&mentions, enabled_instances)?;
+            let (matched_base_names, unmatched) = resolve_targets(&mentions, enabled_instances, aliases)?;
 
             // STRICT: fail on unmatched mentions
             if !unmatched.is_empty() {
@@ -561,11 +575,12 @@ fn build_message_prefix(msg: &Value) -> String {
         (None, None) => "new message".to_string(),
     };
 
-    // Non-auto delivery lanes are operator-visible routing signals; surface them.
+    // Only a lane that deviates from the default is an operator-visible routing
+    // signal. `queue` is the default now, and legacy rows say "auto" or nothing.
     let delivery = msg
         .get("delivery")
         .and_then(|v| v.as_str())
-        .filter(|d| *d != "auto");
+        .filter(|d| *d == "steer");
     let prefix = if let Some(d) = delivery {
         format!("{d} {prefix}")
     } else {
@@ -1101,11 +1116,17 @@ mod tests {
 
     #[test]
     fn test_match_target_bigboss_remote() {
-        let instances = make_instances(&[("luna", None), ("bigboss", None)]);
+        let instances = make_instances(&[("luna", None)]);
         assert_eq!(
             match_target("bigboss:BOXE", &instances).unwrap(),
-            vec!["bigboss"]
+            vec![SENDER]
         );
+        assert_eq!(
+            match_target("overseer:BOXE", &instances).unwrap(),
+            vec![SENDER]
+        );
+        assert_eq!(match_target("bigboss", &instances).unwrap(), vec![SENDER]);
+        assert_eq!(match_target("overseer", &instances).unwrap(), vec![SENDER]);
     }
 
     #[test]
@@ -1142,7 +1163,7 @@ mod tests {
     #[test]
     fn test_compute_scope_broadcast() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hello everyone", &instances, None).unwrap();
+        let result = compute_scope("hello everyone", &instances, None, &HashMap::new()).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
         assert!(result.mentions.is_empty());
     }
@@ -1150,7 +1171,7 @@ mod tests {
     #[test]
     fn test_compute_scope_mention_in_text() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hey @luna fix this", &instances, None).unwrap();
+        let result = compute_scope("hey @luna fix this", &instances, None, &HashMap::new()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1158,7 +1179,7 @@ mod tests {
     #[test]
     fn test_compute_scope_exact_name_beats_tag_prefix_collision() {
         let instances = vec![info("giru", None), info("lasa", Some("giru-test"))];
-        let result = compute_scope("hey @giru", &instances, None).unwrap();
+        let result = compute_scope("hey @giru", &instances, None, &HashMap::new()).unwrap();
         assert_eq!(result.mentions, vec!["giru"]);
     }
 
@@ -1166,7 +1187,7 @@ mod tests {
     fn test_compute_scope_explicit_targets() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["luna".to_string()];
-        let result = compute_scope("fix this", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("fix this", &instances, Some(&targets), &HashMap::new()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1175,7 +1196,7 @@ mod tests {
     fn test_compute_scope_explicit_empty_broadcast() {
         let instances = vec![info("luna", None)];
         let targets: Vec<String> = vec![];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &HashMap::new()).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
     }
 
@@ -1183,7 +1204,7 @@ mod tests {
     fn test_compute_scope_unknown_target_fails() {
         let instances = vec![info("luna", None)];
         let targets = vec!["nonexistent".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets));
+        let result = compute_scope("hello", &instances, Some(&targets), &HashMap::new());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-existent or stopped"));
     }
@@ -1194,7 +1215,7 @@ mod tests {
         // should point users at the right form instead of just listing 30 names.
         let instances = vec![info("zeli:ZOME", None), info("luna", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), &HashMap::new()).unwrap_err();
         assert!(err.contains("@zeli"), "got: {err}");
         assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
     }
@@ -1203,21 +1224,21 @@ mod tests {
     fn test_compute_scope_no_suggestion_when_no_remote_match() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), &HashMap::new()).unwrap_err();
         assert!(!err.contains("Did you mean"), "got: {err}");
     }
 
     #[test]
     fn test_compute_scope_unknown_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @nonexistent fix this", &instances, None);
+        let result = compute_scope("hey @nonexistent fix this", &instances, None, &HashMap::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_compute_scope_system_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @[hcom-events]", &instances, None);
+        let result = compute_scope("hey @[hcom-events]", &instances, None, &HashMap::new());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("System notifications"));
     }
@@ -1225,7 +1246,7 @@ mod tests {
     #[test]
     fn test_compute_scope_literal_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("use @mention to target", &instances, None);
+        let result = compute_scope("use @mention to target", &instances, None, &HashMap::new());
         assert!(result.is_err());
         assert!(
             result
@@ -1238,7 +1259,7 @@ mod tests {
     fn test_compute_scope_tagged_instances() {
         let instances = vec![info("luna", Some("api")), info("nova", Some("api"))];
         let targets = vec!["api-".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &HashMap::new()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert!(result.mentions.contains(&"luna".to_string()));
         assert!(result.mentions.contains(&"nova".to_string()));
@@ -1249,9 +1270,44 @@ mod tests {
         let instances = vec![info("luna", Some("api"))];
         // Both api-luna and luna resolve to the same instance
         let targets = vec!["api-luna".to_string(), "luna".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &HashMap::new()).unwrap();
         assert_eq!(result.mentions.len(), 1);
         assert_eq!(result.mentions[0], "luna");
+    }
+
+    #[test]
+    fn resolve_targets_follows_rename_alias() {
+        let instances = vec![InstanceInfo {
+            name: "luna_lead".to_string(),
+            tag: None,
+        }];
+        let aliases = HashMap::from([("luna".to_string(), "luna_lead".to_string())]);
+
+        let (matched, unmatched) =
+            resolve_targets(&["luna".to_string()], &instances, &aliases).unwrap();
+        assert_eq!(matched, vec!["luna_lead".to_string()]);
+        assert!(unmatched.is_empty());
+
+        // Current name still matches exactly.
+        let (matched, _) =
+            resolve_targets(&["luna_lead".to_string()], &instances, &aliases).unwrap();
+        assert_eq!(matched, vec!["luna_lead".to_string()]);
+
+        // Alias whose current row is gone stays unmatched.
+        let (_, unmatched) =
+            resolve_targets(&["luna".to_string()], &[], &aliases).unwrap();
+        assert_eq!(unmatched, vec!["luna".to_string()]);
+    }
+
+    #[test]
+    fn compute_scope_mentions_follow_rename_alias() {
+        let instances = vec![InstanceInfo {
+            name: "luna_lead".to_string(),
+            tag: None,
+        }];
+        let aliases = HashMap::from([("luna".to_string(), "luna_lead".to_string())]);
+        let result = compute_scope("hey @luna fix this", &instances, None, &aliases).unwrap();
+        assert_eq!(result.mentions, vec!["luna_lead".to_string()]);
     }
 
     // ---- should_deliver_message ----
@@ -1829,25 +1885,33 @@ mod tests {
 
     #[test]
     fn delivery_lane_roundtrip() {
-        assert_eq!("auto".parse::<DeliveryLane>().unwrap(), DeliveryLane::Auto);
-        assert_eq!("steer".parse::<DeliveryLane>().unwrap(), DeliveryLane::Steer);
-        assert_eq!("queue".parse::<DeliveryLane>().unwrap(), DeliveryLane::Queue);
+        assert_eq!(
+            "steer".parse::<DeliveryLane>().unwrap(),
+            DeliveryLane::Steer
+        );
+        assert_eq!(
+            "queue".parse::<DeliveryLane>().unwrap(),
+            DeliveryLane::Queue
+        );
         assert!("bogus".parse::<DeliveryLane>().is_err());
-        assert_eq!(DeliveryLane::default(), DeliveryLane::Auto);
+        assert!("auto".parse::<DeliveryLane>().is_err());
+        assert_eq!(DeliveryLane::default(), DeliveryLane::Queue);
         assert_eq!(DeliveryLane::Steer.as_str(), "steer");
     }
 
     #[test]
-    fn build_message_prefix_shows_non_auto_lane() {
+    fn build_message_prefix_shows_steer_lane() {
         let msg = serde_json::json!({"delivery": "steer", "event_id": 42});
         assert_eq!(build_message_prefix(&msg), "[steer new message #42]");
     }
 
     #[test]
-    fn build_message_prefix_hides_auto_lane() {
-        let msg = serde_json::json!({"delivery": "auto", "event_id": 42});
-        assert_eq!(build_message_prefix(&msg), "[new message #42]");
-        let legacy = serde_json::json!({"event_id": 42});
-        assert_eq!(build_message_prefix(&legacy), "[new message #42]");
+    fn build_message_prefix_hides_the_default_lane() {
+        let queued = serde_json::json!({"delivery": "queue", "event_id": 42});
+        assert_eq!(build_message_prefix(&queued), "[new message #42]");
+        let legacy_auto = serde_json::json!({"delivery": "auto", "event_id": 42});
+        assert_eq!(build_message_prefix(&legacy_auto), "[new message #42]");
+        let legacy_absent = serde_json::json!({"event_id": 42});
+        assert_eq!(build_message_prefix(&legacy_absent), "[new message #42]");
     }
 }

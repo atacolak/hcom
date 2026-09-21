@@ -156,7 +156,7 @@ fn plugin_delivery_reports_active_edge() {
 #[test]
 fn plugin_acks_pending_delivery_by_exact_ids() {
     // The lane table itself is pinned BEHAVIOURALLY by the plugin's own bun
-    // suite (`npm run test:plugin`), which drives idle/active x auto/steer/queue
+    // suite (`npm run test:plugin`), which drives idle/active x steer/queue
     // through a fake pi context; no source-text assertion can express that.
     //
     // What only cargo can guard is the Rust<->plugin contract. The ack must name
@@ -187,21 +187,28 @@ fn plugin_acks_pending_delivery_by_exact_ids() {
 #[test]
 fn plugin_acks_a_deferred_batch_when_its_consuming_turn_starts() {
     // A batch injected with an explicit `deliverAs` (the `followUp` lane) cannot
-    // be acked at injection time — its consuming turn may not exist yet. Both
-    // turn starts must therefore ack a tracked batch:
+    // be acked at injection time — its consuming turn may not exist yet — and it
+    // must not be acked merely because that run started either: the injected
+    // prompt may still be unwritten, and moving the cursor then loses the mail a
+    // recycle would have re-fetched. Both turn starts must therefore SETTLE a
+    // tracked batch through the persist gate (`settlePendingAck`, which acks only
+    // once the transcript holds the prompt — the naked ack this guards against is
+    // how 0.7.25 recorded mail as delivered that the session never consumed):
     //   - `before_agent_start` covers the bodyless-wake transform, which omp
     //     applies INLINE and never re-emits as an input event with
     //     source "extension" (so the input handler's extension-ack is dead here);
     //   - `agent_start` covers the queued-message drain, which does not go
     //     through `prompt()` and so fires NO `before_agent_start` at all.
-    // Missing either path strands the batch tracked-but-unacked, and the missing
-    // drain-path ack is exactly how 0.7.25 left mail recorded as delivered that
-    // the session never consumed.
+    // Missing either path strands the batch tracked-but-unacked.
     for event in ["before_agent_start", "agent_start"] {
         let handler = plugin_block(PLUGIN_SOURCE, &format!("pi.on(\"{event}\""), "\n\tpi.on(");
         assert!(
-            handler.contains("ackPending("),
-            "the {event} handler must ack the tracked batch"
+            handler.contains("settlePendingAck("),
+            "the {event} handler must settle the tracked batch through the persist gate"
+        );
+        assert!(
+            !handler.contains("ackPending("),
+            "the {event} handler must not ack a batch whose prompt is not on disk yet"
         );
     }
     // Bounds the slices above (they are not reaching into later handlers) and

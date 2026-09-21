@@ -251,7 +251,26 @@ fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
 /// Unix uses `exec()` and only returns (an error) on failure. Windows has no
 /// `exec`, so it spawns the command, waits, and exits with the child's status
 /// code — likewise not returning on success.
+///
+/// The replacement must not start with the caller's inherited descriptors, for
+/// the reason [`spawn_detached`] gives: `--run-here` reaches the launched agent
+/// through this function rather than through a spawn, so the runner script's
+/// shell would otherwise hand the caller's transcript descriptors on to the
+/// chained `hcom pty` and the tool it execs.
 pub fn exec_replace(mut cmd: Command) -> std::io::Error {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook only calls raw syscalls, so it is async-signal-safe
+        // between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                cloexec_inherited_fds();
+                Ok(())
+            });
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -421,6 +440,123 @@ fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
     Some(parents)
 }
 
+/// Size of the `getdents64` result buffer: one page, as before.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const DIRENT_BUF_LEN: usize = 4096;
+
+/// A `getdents64` result buffer, aligned for the `dirent` records read out of
+/// it. The records are read in place through a `dirent` pointer, so the buffer
+/// must be aligned like one; a bare `[u8; _]` is 1-aligned, which would make
+/// that read an unaligned load. 8 covers `dirent` on every Linux/Android target
+/// this is compiled for (its widest member is a 64-bit inode/offset).
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[repr(align(8))]
+struct DirentBuf([u8; DIRENT_BUF_LEN]);
+
+/// Mark every inherited descriptor above stdio close-on-exec in the child.
+///
+/// The enclosing agent runtime (omp/Bun) opens its transcript without
+/// `O_CLOEXEC`, so the hcom CLI inherits a live fd to it and passes it on to
+/// everything it spawns for a launch. `pidtrack`'s live-owner probe reads a
+/// launched process's fd table as the sessions that process holds, so a leaked
+/// caller transcript there makes a fresh launch look like a live-owner name
+/// steal (the child then never binds).
+///
+/// Linux/Android only — the same platforms where that probe can see fds.
+/// Raw syscalls only: this runs between `fork` and `exec`, where allocation is
+/// not async-signal-safe.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn cloexec_inherited_fds() {
+    // SAFETY: every call below is a raw syscall on a buffer this frame owns.
+    // No allocation, no locks: safe between fork and exec.
+    unsafe {
+        // `c"…"` literal keeps this allocation-free.
+        let dir = libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        );
+        if dir < 0 {
+            return;
+        }
+        let mut buf = DirentBuf([0u8; DIRENT_BUF_LEN]);
+        loop {
+            let read = libc::syscall(
+                libc::SYS_getdents64,
+                dir,
+                buf.0.as_mut_ptr().cast::<libc::c_void>(),
+                buf.0.len(),
+            );
+            if read <= 0 {
+                break;
+            }
+            let read = read as usize;
+            let mut offset = 0usize;
+            while offset < read {
+                let entry = buf.0.as_ptr().add(offset).cast::<libc::dirent>();
+                let reclen = (*entry).d_reclen as usize;
+                // A zero-length record, or one running past what was read, ends
+                // the walk: reading on would treat the buffer's tail as though
+                // it held a record header.
+                if reclen == 0 || offset + reclen > read {
+                    break;
+                }
+                match parse_fd_name(&(*entry).d_name) {
+                    Some(fd) if fd > 2 && fd != dir => {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                    _ => {}
+                }
+                offset += reclen;
+            }
+        }
+        libc::close(dir);
+    }
+}
+
+/// Parse a `/proc/self/fd` entry name as a descriptor number. Allocation-free.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn parse_fd_name(name: &[libc::c_char; 256]) -> Option<libc::c_int> {
+    let mut fd: libc::c_int = 0;
+    for (i, byte) in name.iter().enumerate() {
+        let byte = *byte as u8;
+        if byte == 0 {
+            return (i > 0).then_some(fd);
+        }
+        // Nine digits cover every real descriptor; more is not a name we parse.
+        if i > 8 || !byte.is_ascii_digit() {
+            return None;
+        }
+        fd = fd * 10 + libc::c_int::from(byte - b'0');
+    }
+    None
+}
+
+/// Mark the child's inherited descriptors close-on-exec on a command built by
+/// the caller.
+///
+/// [`spawn_detached`] and [`exec_replace`] install this on the commands they
+/// own; a caller that builds and spawns its own command (the pty wrapper) needs
+/// the same hygiene, for the reason [`cloexec_inherited_fds`] gives.
+///
+/// No-op where [`cloexec_inherited_fds`] is: this only matters on the platforms
+/// whose pidtrack probe can see a process's fds.
+pub(crate) fn harden_child_fds(cmd: &mut Command) {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook only calls raw syscalls, so it is async-signal-safe
+        // between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                cloexec_inherited_fds();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    let _ = cmd;
+}
+
 /// Spawn a detached child without leaking the caller's captured stdio handles.
 ///
 /// On Windows, `Command` must enable handle inheritance for explicitly supplied
@@ -428,8 +564,25 @@ fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
 /// list, that can also inherit the hcom CLI's own stdout/stderr pipes. A caller
 /// using `Command::output()` then waits forever for EOF after hcom exits because
 /// the long-lived agent still owns duplicate pipe handles.
+///
+/// On Linux/Android the same long-lived agents must not inherit the caller's
+/// other descriptors either: see [`cloexec_inherited_fds`] for what a leaked
+/// transcript fd does to a launch.
 pub fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Child> {
     detach_session(command);
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook only calls raw syscalls, so it is async-signal-safe
+        // between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                cloexec_inherited_fds();
+                Ok(())
+            });
+        }
+    }
 
     #[cfg(not(windows))]
     {
@@ -794,6 +947,146 @@ mod tests {
         // and the walk behaves as it did before the check existed.
         assert!(child_link_is_plausible(None, Some(1)));
         assert!(child_link_is_plausible(Some(500), None));
+    }
+
+    /// The enclosing agent runtime (omp/Bun) opens its transcript without
+    /// `O_CLOEXEC`, so every process it spawns — the hcom CLI included — holds
+    /// a live fd to it. A launched agent must not carry that fd: pidtrack's
+    /// live-owner probe reads the launched pid's fd table as "sessions this
+    /// process holds", so an inherited caller transcript makes a fresh launch
+    /// look like a name steal and the child never binds.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn spawn_detached_starts_the_child_without_the_callers_fds() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("2026-09-17T00-52-00-000Z_01a085ab.jsonl");
+        let path = std::ffi::CString::new(transcript.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: opening a path this test owns; the fd is closed below.
+        let inherited =
+            unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(
+            inherited > 2,
+            "expected a fresh descriptor above stdio, got {inherited}"
+        );
+
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(format!(
+                "[ -e /proc/self/fd/{inherited} ] && echo inherited || echo clean"
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let spawned = spawn_detached(&mut command)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+
+        // SAFETY: `inherited` was opened above and is unused from here on.
+        unsafe { libc::close(inherited) };
+
+        assert_eq!(
+            String::from_utf8_lossy(&spawned.stdout).trim(),
+            "clean",
+            "the child inherited a caller descriptor; a launched agent holding the \
+             caller's transcript is read as a live-owner name steal"
+        );
+    }
+
+    /// The `/proc/self/fd` walk reads `dirent` records in place out of the
+    /// buffer, so the buffer must be aligned like a `dirent`: a bare `[u8; _]`
+    /// is 1-aligned, and the cast would be an unaligned load.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn dirent_buffer_is_aligned_for_in_place_record_reads() {
+        assert!(
+            std::mem::align_of::<DirentBuf>() >= std::mem::align_of::<libc::dirent>(),
+            "an unaligned record read is undefined behaviour"
+        );
+    }
+
+    /// `--run-here` never reaches [`spawn_detached`]: it replaces the hcom CLI
+    /// with the runner script's shell ([`exec_replace`]), which stays the parent
+    /// of the launched agent. So the same leak needs the same hygiene on the
+    /// exec boundary — the shell inherits the caller's transcript descriptors
+    /// and hands them to everything it goes on to launch.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn exec_replace_does_not_hand_the_callers_fds_to_the_replaced_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("2026-09-17T00-52-00-000Z_01a085ab.jsonl");
+        let path = std::ffi::CString::new(transcript.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: opening a path this test owns; the fd is closed below.
+        let inherited =
+            unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(
+            inherited > 2,
+            "expected a fresh descriptor above stdio, got {inherited}"
+        );
+
+        // `exec_replace` replaces the process that calls it, so the probe has to
+        // be a process of its own: the test binary re-runs itself on the ignored
+        // probe below, which opens nothing and inherits `inherited` from here.
+        let verdict = dir.path().join("verdict");
+        let probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sys::process::tests::exec_replace_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HCOM_FD_PROBE", inherited.to_string())
+            .env("HCOM_FD_VERDICT", &verdict)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        // SAFETY: `inherited` was opened above and is unused from here on.
+        unsafe { libc::close(inherited) };
+
+        assert!(
+            probe.status.success(),
+            "exec probe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&verdict)
+                .unwrap_or_else(|error| panic!("exec probe left no verdict: {error}")),
+            "clean",
+            "the replaced process inherited a caller descriptor; a launched agent \
+             holding the caller's transcript is read as a live-owner name steal"
+        );
+    }
+
+    /// Exec target for
+    /// [`exec_replace_does_not_hand_the_callers_fds_to_the_replaced_process`].
+    /// It must be a process of its own, because the code under test replaces it.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    #[ignore = "exec target, run by exec_replace_does_not_hand_the_callers_fds_to_the_replaced_process"]
+    fn exec_replace_probe() {
+        let probe: libc::c_int = std::env::var("HCOM_FD_PROBE")
+            .expect("HCOM_FD_PROBE must be set by the calling test")
+            .parse()
+            .expect("HCOM_FD_PROBE must be a descriptor number");
+        // Self-control: a "clean" verdict must mean the exec dropped the
+        // descriptor, not that the descriptor was never handed over.
+        // SAFETY: probing a descriptor this process already holds.
+        assert!(
+            unsafe { libc::fcntl(probe, libc::F_GETFD) } >= 0,
+            "probe descriptor {probe} must be open before the exec"
+        );
+
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(format!(
+            "if [ -e /proc/self/fd/{probe} ]; then verdict=inherited; else verdict=clean; fi; \
+             printf %s \"$verdict\" > \"$HCOM_FD_VERDICT\""
+        ));
+        let error = exec_replace(command);
+        panic!("exec_replace returned instead of replacing this process: {error}");
     }
 
     // The case that matters in practice, against real `GetProcessTimes` data: a
