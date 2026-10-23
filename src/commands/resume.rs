@@ -1027,81 +1027,146 @@ fn load_instance_data(
 }
 
 /// Load stopped snapshot from life events.
+///
+/// Identity (session, cwd, tool, tag) comes from the newest stop. `launch_args`
+/// is the argv of the last incarnation that actually reached `ready`. A spawn
+/// that died before ready (`created` → `launch_failed` → `stopped`) is not a
+/// session — its extras must not become the identity's replay argv. Snapshots
+/// with no `created` event (legacy / tests) cannot be proven failed and keep
+/// their stored args.
 fn load_stopped_snapshot(
     db: &HcomDb,
     name: &str,
 ) -> Result<(String, String, String, String, bool, i64, String)> {
-    // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
-    // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
-        "SELECT data FROM events
+        "SELECT id, data FROM events
          WHERE type='life'
            AND instance=?
            AND json_extract(data, '$.action') = 'stopped'
-         ORDER BY id DESC LIMIT 1",
+         ORDER BY id DESC",
     )?;
 
-    let rows: Vec<String> = stmt
-        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(rusqlite::params![name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
-    for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
-            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
-            && let Some(snapshot) = data.get("snapshot")
-        {
-            let tool = snapshot
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let session_id = snapshot
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let launch_args = snapshot
-                .get("launch_args")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tag = snapshot
-                .get("tag")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let background = snapshot
-                .get("background")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                != 0;
-            let last_event_id = snapshot
-                .get("last_event_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let directory = snapshot
-                .get("directory")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+    let mut identity: Option<(String, String, String, bool, i64, String)> = None;
+    let mut durable_launch_args: Option<String> = None;
 
-            return Ok((
+    for (stop_id, data_str) in &rows {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) else {
+            continue;
+        };
+        if data.get("action").and_then(|v| v.as_str()) != Some("stopped") {
+            continue;
+        }
+        let Some(snapshot) = data.get("snapshot") else {
+            continue;
+        };
+
+        let tool = snapshot
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = snapshot
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let launch_args = snapshot
+            .get("launch_args")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]")
+            .to_string();
+        let tag = snapshot
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let background = snapshot
+            .get("background")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            != 0;
+        let last_event_id = snapshot
+            .get("last_event_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let directory = snapshot
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if identity.is_none() {
+            identity = Some((
                 tool,
                 session_id,
-                launch_args,
                 tag,
                 background,
                 last_event_id,
                 directory,
             ));
         }
+
+        if durable_launch_args.is_none()
+            && !incarnation_never_reached_ready(db, name, *stop_id)
+        {
+            durable_launch_args = Some(launch_args);
+        }
+
+        if identity.is_some() && durable_launch_args.is_some() {
+            break;
+        }
     }
 
-    bail!(
-        "No stopped snapshot found for '{name}'. Not a known hcom instance, \
-         session UUID, or recognized thread name."
-    )
+    let Some((tool, session_id, tag, background, last_event_id, directory)) = identity else {
+        bail!(
+            "No stopped snapshot found for '{name}'. Not a known hcom instance, \
+             session UUID, or recognized thread name."
+        )
+    };
+
+    Ok((
+        tool,
+        session_id,
+        durable_launch_args.unwrap_or_else(|| "[]".to_string()),
+        tag,
+        background,
+        last_event_id,
+        directory,
+    ))
+}
+
+fn last_life_action_id(db: &HcomDb, name: &str, action: &str, before_id: i64) -> Option<i64> {
+    db.conn()
+        .query_row(
+            "SELECT MAX(id) FROM events
+             WHERE type = 'life'
+               AND instance = ?1
+               AND id < ?2
+               AND json_extract(data, '$.action') = ?3",
+            rusqlite::params![name, before_id, action],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// True when this stop belongs to a spawn that never reached `ready`.
+/// Unprovable (no `created` event) → false, keep stored args.
+fn incarnation_never_reached_ready(db: &HcomDb, name: &str, stop_id: i64) -> bool {
+    let Some(created_id) = last_life_action_id(db, name, "created", stop_id) else {
+        return false;
+    };
+    match last_life_action_id(db, name, "ready", stop_id) {
+        Some(ready_id) if ready_id > created_id => false,
+        _ => true,
+    }
 }
 
 /// Build tool-specific resume/fork args from the integration spec.
@@ -3652,6 +3717,136 @@ mod tests {
                 rusqlite::params!["2026-01-01T00:00:00Z", name, snapshot.to_string()],
             )
             .unwrap();
+    }
+
+    fn insert_life(db: &HcomDb, name: &str, ts: &str, data: serde_json::Value) {
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params![ts, name, data.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn stopped_snapshot(session_id: &str, directory: &str, launch_args: &str) -> serde_json::Value {
+        json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "omp",
+                "session_id": session_id,
+                "launch_args": launch_args,
+                "tag": "project-lead",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": directory
+            }
+        })
+    }
+
+    #[test]
+    fn failed_spawn_stop_does_not_own_launch_args() {
+        let db = test_db();
+        let sid = "01a070ec-d50c-7000-89ea-a22da8c94c3d";
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T06:37:39Z",
+            json!({"action": "created"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T06:37:41Z",
+            json!({"action": "ready"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:41Z",
+            stopped_snapshot(sid, "/home/sf/workspace/systemd-ops", "[]"),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:45Z",
+            json!({"action": "created"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:46Z",
+            json!({"action": "launch_failed", "reason": "ready_never_observed"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:47Z",
+            stopped_snapshot(sid, "/home/sf/workspace/systemd-ops", r#"["--go9"]"#),
+        );
+
+        let (tool, session_id, launch_args, tag, _, _, directory) =
+            load_stopped_snapshot(&db, "hera").unwrap();
+        assert_eq!(tool, "omp");
+        assert_eq!(session_id, sid);
+        assert_eq!(tag, "project-lead");
+        assert_eq!(directory, "/home/sf/workspace/systemd-ops");
+        assert_eq!(
+            launch_args, "[]",
+            "failed spawn extras must not become identity argv, got {launch_args}"
+        );
+    }
+
+    #[test]
+    fn last_ready_incarnation_keeps_durable_tool_args() {
+        let db = test_db();
+        let sid = "01a070ec-d50c-7000-89ea-a22da8c94c3d";
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-01T00:00:00Z",
+            json!({"action": "created"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-01T00:00:01Z",
+            json!({"action": "ready"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-01T00:00:02Z",
+            stopped_snapshot(sid, "/tmp", r#"["--model","opus"]"#),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:45Z",
+            json!({"action": "created"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:46Z",
+            json!({"action": "launch_failed"}),
+        );
+        insert_life(
+            &db,
+            "hera",
+            "2026-10-23T15:22:47Z",
+            stopped_snapshot(sid, "/tmp", r#"["--go9"]"#),
+        );
+
+        let (_, _, launch_args, _, _, _, _) = load_stopped_snapshot(&db, "hera").unwrap();
+        assert_eq!(launch_args, r#"["--model","opus"]"#);
+    }
+
+    #[test]
+    fn unprovable_stop_keeps_stored_launch_args() {
+        let db = test_db();
+        seed_stopped_session_with_args(&db, "luna", "sess-1", "/tmp", r#"["--model","haiku"]"#);
+        let (_, _, launch_args, _, _, _, _) = load_stopped_snapshot(&db, "luna").unwrap();
+        assert_eq!(launch_args, r#"["--model","haiku"]"#);
     }
 
     /// Point the OMP session root at an isolated HOME so transcript presence is
